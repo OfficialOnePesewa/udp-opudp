@@ -4,27 +4,30 @@
 #  Author  : OfficialOnePesewa
 #  GitHub  : https://github.com/OfficialOnePesewa/udp-opudp
 #  Command : opudp
+#  Version : 2.0.0
 # ============================================================
 #
-#  CREDENTIAL GUIDE (read this once):
+#  CREDENTIAL GUIDE:
 #  ─────────────────────────────────────────────────────────
 #  USERNAME  → label only (for your records in this panel)
 #  PASSWORD  → what you enter in the ZIVPN Pro app
+#  MAX CONN  → how many devices can connect with that password
+#              0 = unlimited
 #
-#  In the ZIVPN app UDP Tunnel dialog:
-#    UDP Server   = your VPS IP
-#    UDP Password = the PASSWORD you set here
-#  The username is NOT used by the ZIVPN protocol.
+#  users.db format:
+#  username:password:expiry:bandwidth:max_conn
 # ============================================================
 
 CONFIG="/etc/zivpn/config.json"
 USERS_DB="/etc/zivpn/users.db"
 PORT_FILE="/etc/zivpn/port_range"
 BACKUP_DIR="/etc/zivpn/backups"
+SESSIONS_DIR="/etc/zivpn/sessions"
+CONN_LOG="/etc/zivpn/connections.log"
 SVC="zivpn"
 BIN="/usr/local/bin/zivpn"
 LISTEN_PORT="5667"
-PANEL_VERSION="1.0.0"
+PANEL_VERSION="2.0.0"
 GITHUB_RAW="https://raw.githubusercontent.com/OfficialOnePesewa/udp-opudp/main"
 
 # ── Colours ──────────────────────────────────────────────────
@@ -37,9 +40,28 @@ M='\033[0;35m'  ; NC='\033[0m'
 
 # ── Init ──────────────────────────────────────────────────────
 init() {
-    mkdir -p /etc/zivpn "$BACKUP_DIR"
+    mkdir -p /etc/zivpn "$BACKUP_DIR" "$SESSIONS_DIR"
     [[ ! -f "$USERS_DB"  ]] && touch "$USERS_DB"
     [[ ! -f "$PORT_FILE" ]] && echo "6000:19999" > "$PORT_FILE"
+    [[ ! -f "$CONN_LOG"  ]] && touch "$CONN_LOG"
+    migrate_db
+}
+
+# ── Migrate old DB (adds max_conn=0 if missing) ───────────────
+migrate_db() {
+    local tmp
+    tmp=$(mktemp)
+    local changed=0
+    while IFS=':' read -r u p e bw mc; do
+        [[ -z "$u" ]] && continue
+        if [[ -z "$mc" ]]; then
+            echo "${u}:${p}:${e}:${bw}:0" >> "$tmp"
+            changed=1
+        else
+            echo "${u}:${p}:${e}:${bw}:${mc}" >> "$tmp"
+        fi
+    done < "$USERS_DB"
+    [[ $changed -eq 1 ]] && mv "$tmp" "$USERS_DB" || rm -f "$tmp"
 }
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -67,16 +89,56 @@ days_left() {
 
 count_active() {
     local n=0
-    while IFS=':' read -r u p e bw; do
+    while IFS=':' read -r u p e bw mc; do
         [[ -z "$u" ]] && continue
         is_expired "$e" || n=$((n+1))
     done < "$USERS_DB"
     echo "$n"
 }
 
+count_live_connections() {
+    ss -u state established 2>/dev/null | \
+        grep ":${LISTEN_PORT}" | \
+        awk '{print $5}' | \
+        cut -d: -f1 | \
+        sort -u | \
+        wc -l
+}
+
+get_connected_ips() {
+    ss -u state established 2>/dev/null | \
+        grep ":${LISTEN_PORT}" | \
+        awk '{print $5}' | \
+        cut -d: -f1 | \
+        sort -u
+}
+
+count_user_connections() {
+    local password="$1"
+    local session_file="${SESSIONS_DIR}/${password}.sessions"
+    [[ ! -f "$session_file" ]] && echo "0" && return
+    local live_ips
+    live_ips=$(get_connected_ips)
+    local active=0
+    while read -r ip; do
+        [[ -z "$ip" ]] && continue
+        if echo "$live_ips" | grep -q "^${ip}$"; then
+            active=$((active + 1))
+        fi
+    done < "$session_file"
+    local tmp
+    tmp=$(mktemp)
+    while read -r ip; do
+        [[ -z "$ip" ]] && continue
+        echo "$live_ips" | grep -q "^${ip}$" && echo "$ip" >> "$tmp"
+    done < "$session_file"
+    mv "$tmp" "$session_file"
+    echo "$active"
+}
+
 rebuild_config() {
     local pwds=()
-    while IFS=':' read -r u p e bw; do
+    while IFS=':' read -r u p e bw mc; do
         [[ -z "$u" || -z "$p" ]] && continue
         is_expired "$e" || pwds+=("\"$p\"")
     done < "$USERS_DB"
@@ -101,13 +163,31 @@ rebuild_config() {
 EOF
 }
 
+apply_conn_limits() {
+    iptables -L INPUT --line-numbers -n 2>/dev/null | \
+        grep "connlimit" | awk '{print $1}' | sort -rn | \
+        xargs -I{} iptables -D INPUT {} 2>/dev/null
+
+    while IFS=':' read -r u p e bw mc; do
+        [[ -z "$u" ]] && continue
+        is_expired "$e" && continue
+        if [[ "$mc" -gt 0 ]] 2>/dev/null; then
+            iptables -A INPUT -p udp --dport "$LISTEN_PORT" \
+                -m connlimit --connlimit-above "$mc" --connlimit-mask 32 \
+                -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
+        fi
+    done < "$USERS_DB"
+}
+
+# ── Header ─────────────────────────────────────────────────────
 show_header() {
     clear
-    local svc_st users port ip
+    local svc_st users port ip live_conn
     svc_st=$(systemctl is-active "$SVC" 2>/dev/null)
     users=$(count_active)
     port=$(get_port)
     ip=$(get_ip)
+    live_conn=$(count_live_connections)
 
     echo -e "${C}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${C}║${W}       EXPIRY + BANDWIDTH  Ultimate Control Panel             ${C}║${NC}"
@@ -115,14 +195,15 @@ show_header() {
     echo -e "${C}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     if [[ "$svc_st" == "active" ]]; then
-        echo -e "  Service: ${G}active${NC}    Total Users: ${G}${users}${NC}"
+        echo -e "  Service: ${G}active${NC}    Total Users: ${G}${users}${NC}    Live Connections: ${G}${live_conn}${NC}"
     else
-        echo -e "  Service: ${R}inactive${NC}  Total Users: ${G}${users}${NC}"
+        echo -e "  Service: ${R}inactive${NC}  Total Users: ${G}${users}${NC}    Live Connections: ${R}0${NC}"
     fi
     echo -e "  IP: ${C}${ip}${NC}   UDP Port Range: ${Y}${port}${NC}   Panel v${PANEL_VERSION}"
     echo ""
 }
 
+# ── Menu ───────────────────────────────────────────────────────
 show_menu() {
     echo -e "  ${G}1)${NC}  Start ZIVPN              ${G}11)${NC} Bandwidth + Expiry Report"
     echo -e "  ${G}2)${NC}  Stop ZIVPN               ${G}12)${NC} Reset All Bandwidth"
@@ -132,12 +213,16 @@ show_menu() {
     echo -e "  ${G}6)${NC}  Add User (with expiry)   ${G}16)${NC} Restore Backup"
     echo -e "  ${G}7)${NC}  Remove User              ${G}17)${NC} Change Port Range"
     echo -e "  ${G}8)${NC}  Renew/Extend User        ${G}18)${NC} Auto-Update ZIVPN"
-    echo -e "  ${G}9)${NC}  Cleanup Expired Users    ${R}99)${NC} UNINSTALL (DANGER)"
+    echo -e "  ${G}9)${NC}  Cleanup Expired Users    ${G}19)${NC} Set Connection Limit"
+    echo -e "  ${G}10)${NC} Connection Stats         ${R}99)${NC} UNINSTALL (DANGER)"
     echo -e "  ${G}0)${NC}  Exit"
     echo ""
     echo -ne "${Y}Choose [0-99] ► ${NC}"
 }
 
+# ══════════════════════════════════════════════════════════════
+#  1) Start
+# ══════════════════════════════════════════════════════════════
 start_svc() {
     echo -e "${Y}Starting ZIVPN...${NC}"
     systemctl start "$SVC"
@@ -149,12 +234,18 @@ start_svc() {
     fi
 }
 
+# ══════════════════════════════════════════════════════════════
+#  2) Stop
+# ══════════════════════════════════════════════════════════════
 stop_svc() {
     echo -e "${Y}Stopping ZIVPN...${NC}"
     systemctl stop "$SVC"
     echo -e "${R}ZIVPN stopped.${NC}"
 }
 
+# ══════════════════════════════════════════════════════════════
+#  3) Restart
+# ══════════════════════════════════════════════════════════════
 restart_svc() {
     echo -e "${Y}Restarting ZIVPN...${NC}"
     systemctl restart "$SVC"
@@ -166,6 +257,9 @@ restart_svc() {
     fi
 }
 
+# ══════════════════════════════════════════════════════════════
+#  4) Status
+# ══════════════════════════════════════════════════════════════
 show_status() {
     echo -e "${C}═══ ZIVPN Service Status ════════════════════════════════════${NC}"
     systemctl status "$SVC" --no-pager -l
@@ -175,44 +269,62 @@ show_status() {
     echo -e "  Users DB    : ${Y}${USERS_DB}${NC}"
     echo -e "  Port file   : ${Y}${PORT_FILE}${NC}"
     echo -e "  Binary      : ${Y}${BIN}${NC}"
+    echo -e "  Sessions    : ${Y}${SESSIONS_DIR}${NC}"
 }
 
+# ══════════════════════════════════════════════════════════════
+#  5) List Users + Expiry
+# ══════════════════════════════════════════════════════════════
 list_users() {
     echo -e "${C}═══ User List ═══════════════════════════════════════════════${NC}"
     if [[ ! -s "$USERS_DB" ]]; then
         echo -e "  ${Y}No users found. Use option 6 to add one.${NC}"
         return
     fi
-    printf "\n  %-20s %-22s %-12s %-10s %s\n" "USERNAME" "PASSWORD" "EXPIRY" "DAYS LEFT" "STATUS"
+    printf "\n  %-18s %-20s %-12s %-8s %-8s %s\n" \
+        "USERNAME" "PASSWORD" "EXPIRY" "DAYS" "MAX CONN" "STATUS"
     divider
-    while IFS=':' read -r u p e bw; do
+    while IFS=':' read -r u p e bw mc; do
         [[ -z "$u" ]] && continue
-        local dl status
+        local dl status conn_display
+        [[ -z "$mc" ]] && mc=0
+        [[ "$mc" -eq 0 ]] && conn_display="∞" || conn_display="$mc"
         if is_expired "$e"; then
             dl="—"
             status="${R}EXPIRED${NC}"
         else
             dl=$(days_left "$e")
-            status="${G}ACTIVE${NC}"
+            if [[ "$dl" != "∞" && "$dl" -le 3 ]]; then
+                status="${Y}EXPIRING${NC}"
+            else
+                status="${G}ACTIVE${NC}"
+            fi
         fi
-        printf "  %-20s %-22s %-12s %-10s " "$u" "$p" "$e" "$dl"
+        printf "  %-18s %-20s %-12s %-8s %-8s " \
+            "$u" "$p" "$e" "$dl" "$conn_display"
         echo -e "$status"
     done < "$USERS_DB"
     echo ""
 }
 
+# ══════════════════════════════════════════════════════════════
+#  6) Add User
+# ══════════════════════════════════════════════════════════════
 add_user() {
     echo -e "${C}═══ Add New User ════════════════════════════════════════════${NC}"
     echo ""
+
     read -rp "  Username: " username
     username=$(echo "$username" | tr -d ' ')
     [[ -z "$username" ]] && echo -e "${R}Username cannot be empty.${NC}" && return
     if grep -q "^${username}:" "$USERS_DB" 2>/dev/null; then
         echo -e "${R}User '${username}' already exists!${NC}"; return
     fi
+
     read -rp "  Password: " password
     password=$(echo "$password" | tr -d ' ')
     [[ -z "$password" ]] && echo -e "${R}Password cannot be empty.${NC}" && return
+
     echo ""
     echo -e "  ${W}Expiry Options:${NC}"
     echo "    1) 1 month    2) 3 months"
@@ -233,11 +345,41 @@ add_user() {
             ;;
         *) echo -e "${R}Invalid choice.${NC}"; return ;;
     esac
-    echo "${username}:${password}:${expiry}:0" >> "$USERS_DB"
+
+    echo ""
+    echo -e "  ${W}Connection Limit (max devices with this password):${NC}"
+    echo "    1) 1 device      2) 2 devices"
+    echo "    3) 3 devices     4) 5 devices"
+    echo "    5) 10 devices    6) Unlimited"
+    echo "    7) Custom number"
+    read -rp "  Choose [1-7]: " conn_choice
+    case $conn_choice in
+        1) max_conn=1  ;;
+        2) max_conn=2  ;;
+        3) max_conn=3  ;;
+        4) max_conn=5  ;;
+        5) max_conn=10 ;;
+        6) max_conn=0  ;;
+        7)
+            read -rp "  Enter max connections (e.g. 4): " max_conn
+            if ! [[ "$max_conn" =~ ^[0-9]+$ ]]; then
+                echo -e "${R}Invalid number. Setting to unlimited.${NC}"
+                max_conn=0
+            fi
+            ;;
+        *) max_conn=0 ;;
+    esac
+
+    echo "${username}:${password}:${expiry}:0:${max_conn}" >> "$USERS_DB"
     rebuild_config
+    apply_conn_limits
     systemctl restart "$SVC" 2>/dev/null
+
     local server_ip
     server_ip=$(get_ip)
+    local conn_label
+    [[ "$max_conn" -eq 0 ]] && conn_label="Unlimited" || conn_label="${max_conn} device(s)"
+
     echo ""
     echo -e "${G}  ✓ User '${username}' added!${NC}"
     echo ""
@@ -245,10 +387,14 @@ add_user() {
     echo -e "${C}  ║${NC}  UDP Server   :  ${Y}${server_ip}${NC}"
     echo -e "${C}  ║${NC}  UDP Password :  ${Y}${password}${NC}  ${G}← enter this in the app${NC}"
     echo -e "${C}  ║${NC}  Expiry       :  ${Y}${expiry}${NC}"
+    echo -e "${C}  ║${NC}  Max Devices  :  ${Y}${conn_label}${NC}"
     echo -e "${C}  ║${NC}  (Username '${username}' is for panel only)${NC}"
     echo -e "${C}  ╚══════════════════════════════════════════════════╝${NC}"
 }
 
+# ══════════════════════════════════════════════════════════════
+#  7) Remove User
+# ══════════════════════════════════════════════════════════════
 remove_user() {
     echo -e "${C}═══ Remove User ═════════════════════════════════════════════${NC}"
     list_users
@@ -260,12 +406,19 @@ remove_user() {
     fi
     read -rp "  Confirm remove '${username}'? [y/N]: " confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "  Cancelled." && return
+    local pass
+    pass=$(grep "^${username}:" "$USERS_DB" | cut -d: -f2)
     sed -i "/^${username}:/d" "$USERS_DB"
+    rm -f "${SESSIONS_DIR}/${pass}.sessions" 2>/dev/null
     rebuild_config
+    apply_conn_limits
     systemctl restart "$SVC" 2>/dev/null
     echo -e "${G}  User '${username}' removed and config reloaded.${NC}"
 }
 
+# ══════════════════════════════════════════════════════════════
+#  8) Renew / Extend User
+# ══════════════════════════════════════════════════════════════
 renew_user() {
     echo -e "${C}═══ Renew / Extend User ═════════════════════════════════════${NC}"
     list_users
@@ -295,33 +448,96 @@ renew_user() {
             ;;
         *) echo -e "${R}Invalid choice.${NC}"; return ;;
     esac
-    sed -i "s/^\(${username}:[^:]*\):[^:]*:\(.*\)$/\1:${new_expiry}:\2/" "$USERS_DB"
+    sed -i "s/^\(${username}:[^:]*\):[^:]*:\([^:]*:[^:]*\)$/\1:${new_expiry}:\2/" "$USERS_DB"
     rebuild_config
     systemctl restart "$SVC" 2>/dev/null
     echo -e "${G}  '${username}' renewed → expiry: ${new_expiry}${NC}"
 }
 
+# ══════════════════════════════════════════════════════════════
+#  9) Cleanup Expired Users
+# ══════════════════════════════════════════════════════════════
 cleanup_expired() {
     echo -e "${C}═══ Cleanup Expired Users ═══════════════════════════════════${NC}"
     local count=0
     local tmp
     tmp=$(mktemp)
-    while IFS=':' read -r u p e bw; do
+    while IFS=':' read -r u p e bw mc; do
         [[ -z "$u" ]] && continue
         if is_expired "$e"; then
             echo -e "  ${R}Removing:${NC} ${u} (expired: ${e})"
+            rm -f "${SESSIONS_DIR}/${p}.sessions" 2>/dev/null
             count=$((count + 1))
         else
-            echo "${u}:${p}:${e}:${bw}" >> "$tmp"
+            echo "${u}:${p}:${e}:${bw}:${mc}" >> "$tmp"
         fi
     done < "$USERS_DB"
     mv "$tmp" "$USERS_DB"
     rebuild_config
+    apply_conn_limits
     systemctl restart "$SVC" 2>/dev/null
     echo ""
     echo -e "${G}  Done. Removed ${count} expired user(s).${NC}"
 }
 
+# ══════════════════════════════════════════════════════════════
+#  10) Connection Stats
+# ══════════════════════════════════════════════════════════════
+conn_stats() {
+    echo -e "${C}═══ Connection Stats ════════════════════════════════════════${NC}"
+    echo ""
+    local total_live
+    total_live=$(count_live_connections)
+    echo -e "  Total live connections to server: ${G}${total_live}${NC}"
+    echo ""
+    local ips
+    ips=$(get_connected_ips)
+    if [[ -n "$ips" ]]; then
+        echo -e "  ${W}Currently connected IPs:${NC}"
+        while read -r ip; do
+            [[ -z "$ip" ]] && continue
+            echo -e "    ${G}→${NC} ${ip}"
+        done <<< "$ips"
+    else
+        echo -e "  ${Y}No active connections detected.${NC}"
+    fi
+    echo ""
+    divider
+    echo ""
+    if [[ ! -s "$USERS_DB" ]]; then
+        echo -e "  ${Y}No users in database.${NC}"
+        return
+    fi
+    printf "  %-18s %-20s %-10s %-10s %s\n" \
+        "USERNAME" "PASSWORD" "MAX CONN" "LIVE" "STATUS"
+    divider
+    while IFS=':' read -r u p e bw mc; do
+        [[ -z "$u" ]] && continue
+        [[ -z "$mc" ]] && mc=0
+        local live_count limit_display conn_status
+        live_count=$(ss -u state established 2>/dev/null | \
+            grep ":${LISTEN_PORT}" | wc -l)
+        [[ "$mc" -eq 0 ]] && limit_display="∞" || limit_display="$mc"
+        if is_expired "$e"; then
+            conn_status="${R}EXPIRED${NC}"
+        elif [[ "$mc" -gt 0 && "$live_count" -ge "$mc" ]]; then
+            conn_status="${R}LIMIT REACHED${NC}"
+        elif [[ "$live_count" -gt 0 ]]; then
+            conn_status="${G}CONNECTED${NC}"
+        else
+            conn_status="${Y}IDLE${NC}"
+        fi
+        printf "  %-18s %-20s %-10s %-10s " \
+            "$u" "$p" "$limit_display" "$live_count"
+        echo -e "$conn_status"
+    done < "$USERS_DB"
+    echo ""
+    echo -e "  ${Y}Tip: Use option 19 to change a user's connection limit.${NC}"
+}
+
+# ══════════════════════════════════════════════════════════════
+#  11) Bandwidth + Expiry Report
+# ══════════════════════════════════════════════════════════════
 bw_report() {
     echo -e "${C}═══ Bandwidth + Expiry Report ═══════════════════════════════${NC}"
     local iface
@@ -340,14 +556,16 @@ bw_report() {
     if [[ ! -s "$USERS_DB" ]]; then
         echo -e "  ${Y}No users.${NC}"; return
     fi
-    printf "  %-20s %-22s %-12s %-10s %s\n" "USERNAME" "PASSWORD" "EXPIRY" "DAYS LEFT" "STATUS"
+    printf "  %-18s %-20s %-12s %-8s %-8s %s\n" \
+        "USERNAME" "PASSWORD" "EXPIRY" "DAYS" "MAX CONN" "STATUS"
     divider
-    while IFS=':' read -r u p e bw; do
+    while IFS=':' read -r u p e bw mc; do
         [[ -z "$u" ]] && continue
-        local dl status
+        [[ -z "$mc" ]] && mc=0
+        local dl status conn_display
+        [[ "$mc" -eq 0 ]] && conn_display="∞" || conn_display="$mc"
         if is_expired "$e"; then
-            dl="—"
-            status="${R}EXPIRED${NC}"
+            dl="—"; status="${R}EXPIRED${NC}"
         else
             dl=$(days_left "$e")
             if [[ "$dl" != "∞" && "$dl" -le 3 ]]; then
@@ -356,14 +574,15 @@ bw_report() {
                 status="${G}ACTIVE${NC}"
             fi
         fi
-        printf "  %-20s %-22s %-12s %-10s " "$u" "$p" "$e" "$dl"
+        printf "  %-18s %-20s %-12s %-8s %-8s " \
+            "$u" "$p" "$e" "$dl" "$conn_display"
         echo -e "$status"
     done < "$USERS_DB"
-    echo ""
-    echo -e "  ${Y}Note: Per-user bandwidth requires ZIVPN Pro API.${NC}"
-    echo -e "  ${Y}Interface totals shown above are server-wide.${NC}"
 }
 
+# ══════════════════════════════════════════════════════════════
+#  12) Reset Bandwidth
+# ══════════════════════════════════════════════════════════════
 reset_bandwidth() {
     echo -e "${C}═══ Reset Bandwidth Counters ════════════════════════════════${NC}"
     read -rp "  Reset iptables byte/packet counters? [y/N]: " confirm
@@ -372,6 +591,9 @@ reset_bandwidth() {
     echo -e "${G}  iptables counters reset.${NC}"
 }
 
+# ══════════════════════════════════════════════════════════════
+#  13) Speed Test
+# ══════════════════════════════════════════════════════════════
 speed_test() {
     echo -e "${C}═══ Speed Test ══════════════════════════════════════════════${NC}"
     if command -v speedtest &>/dev/null; then
@@ -395,12 +617,18 @@ speed_test() {
     fi
 }
 
+# ══════════════════════════════════════════════════════════════
+#  14) Live Logs
+# ══════════════════════════════════════════════════════════════
 live_logs() {
     echo -e "${C}═══ Live Logs — Ctrl+C to stop ══════════════════════════════${NC}"
     echo ""
     journalctl -u "$SVC" -f --no-pager
 }
 
+# ══════════════════════════════════════════════════════════════
+#  15) Backup
+# ══════════════════════════════════════════════════════════════
 backup_data() {
     echo -e "${C}═══ Backup All Data ═════════════════════════════════════════${NC}"
     local name="opudp_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
@@ -411,6 +639,9 @@ backup_data() {
     echo -e "${G}  Backup saved:${NC} ${Y}${path}${NC} (${size})"
 }
 
+# ══════════════════════════════════════════════════════════════
+#  16) Restore Backup
+# ══════════════════════════════════════════════════════════════
 restore_backup() {
     echo -e "${C}═══ Restore Backup ══════════════════════════════════════════${NC}"
     local files
@@ -422,19 +653,24 @@ restore_backup() {
     echo -e "  Available backups:"
     ls -lh "$BACKUP_DIR"/*.tar.gz 2>/dev/null | awk '{print "  "$9, $5}'
     echo ""
-    read -rp "  Enter backup filename (e.g. opudp_backup_20241201_120000.tar.gz): " bname
+    read -rp "  Enter backup filename: " bname
     local bpath="${BACKUP_DIR}/${bname}"
     if [[ ! -f "$bpath" ]]; then
-        echo -e "${R}  File not found: ${bpath}${NC}"; return
+        echo -e "${R}  File not found.${NC}"; return
     fi
     read -rp "  Restore from '${bname}'? This overwrites current data [y/N]: " confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "  Cancelled." && return
     tar -xzf "$bpath" -C / 2>/dev/null
+    migrate_db
     rebuild_config
+    apply_conn_limits
     systemctl restart "$SVC" 2>/dev/null
     echo -e "${G}  Restored from ${bname}.${NC}"
 }
 
+# ══════════════════════════════════════════════════════════════
+#  17) Change Port Range
+# ══════════════════════════════════════════════════════════════
 change_port() {
     echo -e "${C}═══ Change UDP Port Range ═══════════════════════════════════${NC}"
     local current
@@ -470,6 +706,9 @@ change_port() {
     echo -e "${G}  Port range changed to ${pstart}:${pend}${NC}"
 }
 
+# ══════════════════════════════════════════════════════════════
+#  18) Auto-Update
+# ══════════════════════════════════════════════════════════════
 auto_update() {
     echo -e "${C}═══ Auto-Update ZIVPN ═══════════════════════════════════════${NC}"
     local LATEST_URL="https://github.com/zahidbd2/udp-zivpn/releases/latest/download/udp-zivpn-linux-amd64"
@@ -485,10 +724,9 @@ auto_update() {
         rm -f "${BIN}.new"
         systemctl start "$SVC"
     fi
-    echo -e ""
-    echo -e "  ${Y}Updating OPUDP panel to latest version...${NC}"
-    local PANEL_URL="${GITHUB_RAW}/opudp"
-    if wget -q "$PANEL_URL" -O /usr/local/bin/opudp.new; then
+    echo ""
+    echo -e "  ${Y}Updating OPUDP panel...${NC}"
+    if wget -q "${GITHUB_RAW}/opudp" -O /usr/local/bin/opudp.new; then
         chmod +x /usr/local/bin/opudp.new
         mv /usr/local/bin/opudp.new /usr/local/bin/opudp
         echo -e "${G}  OPUDP panel updated. Re-run 'opudp' to use new version.${NC}"
@@ -498,13 +736,66 @@ auto_update() {
     fi
 }
 
+# ══════════════════════════════════════════════════════════════
+#  19) Set Connection Limit
+# ══════════════════════════════════════════════════════════════
+set_conn_limit() {
+    echo -e "${C}═══ Set Connection Limit ════════════════════════════════════${NC}"
+    list_users
+    [[ ! -s "$USERS_DB" ]] && return
+    read -rp "  Enter username to update: " username
+    username=$(echo "$username" | tr -d ' ')
+    if ! grep -q "^${username}:" "$USERS_DB" 2>/dev/null; then
+        echo -e "${R}User '${username}' not found.${NC}"; return
+    fi
+    local current_limit
+    current_limit=$(grep "^${username}:" "$USERS_DB" | cut -d: -f5)
+    [[ -z "$current_limit" ]] && current_limit=0
+    if [[ "$current_limit" -eq 0 ]]; then
+        echo -e "  Current limit: ${G}Unlimited${NC}"
+    else
+        echo -e "  Current limit: ${Y}${current_limit} device(s)${NC}"
+    fi
+    echo ""
+    echo -e "  ${W}New Connection Limit:${NC}"
+    echo "    1) 1 device      2) 2 devices"
+    echo "    3) 3 devices     4) 5 devices"
+    echo "    5) 10 devices    6) Unlimited"
+    echo "    7) Custom number"
+    read -rp "  Choose [1-7]: " conn_choice
+    case $conn_choice in
+        1) new_limit=1  ;;
+        2) new_limit=2  ;;
+        3) new_limit=3  ;;
+        4) new_limit=5  ;;
+        5) new_limit=10 ;;
+        6) new_limit=0  ;;
+        7)
+            read -rp "  Enter max connections: " new_limit
+            if ! [[ "$new_limit" =~ ^[0-9]+$ ]]; then
+                echo -e "${R}Invalid. Setting to unlimited.${NC}"
+                new_limit=0
+            fi
+            ;;
+        *) echo -e "${R}Invalid choice.${NC}"; return ;;
+    esac
+    sed -i "s/^\(${username}:[^:]*:[^:]*:[^:]*\):[^:]*$/\1:${new_limit}/" "$USERS_DB"
+    apply_conn_limits
+    local label
+    [[ "$new_limit" -eq 0 ]] && label="Unlimited" || label="${new_limit} device(s)"
+    echo -e "${G}  '${username}' connection limit set to: ${label}${NC}"
+}
+
+# ══════════════════════════════════════════════════════════════
+#  99) Uninstall
+# ══════════════════════════════════════════════════════════════
 uninstall() {
     echo -e "${R}═══ UNINSTALL ZIVPN + OPUDP (DANGER) ═══════════════════════${NC}"
     echo ""
     echo -e "${R}  This will permanently remove:${NC}"
     echo "    - ZIVPN binary and service"
     echo "    - All user data (/etc/zivpn/)"
-    echo "    - iptables NAT rules"
+    echo "    - iptables NAT + connlimit rules"
     echo "    - The opudp panel command"
     echo ""
     read -rp "  Type 'yes' to confirm uninstall: " confirm
@@ -521,6 +812,9 @@ uninstall() {
     rm -f "$BIN"
     iptables -t nat -D PREROUTING -i "$iface" -p udp \
         --dport "${ps}:${pe}" -j DNAT --to-destination ":${LISTEN_PORT}" 2>/dev/null
+    iptables -L INPUT --line-numbers -n 2>/dev/null | \
+        grep "connlimit" | awk '{print $1}' | sort -rn | \
+        xargs -I{} iptables -D INPUT {} 2>/dev/null
     iptables-save > /etc/iptables/rules.v4 2>/dev/null
     ufw delete allow "${ps}:${pe}/udp"    2>/dev/null
     ufw delete allow "${LISTEN_PORT}/udp" 2>/dev/null
@@ -531,6 +825,9 @@ uninstall() {
     exit 0
 }
 
+# ══════════════════════════════════════════════════════════════
+#  Main loop
+# ══════════════════════════════════════════════════════════════
 init
 
 while true; do
@@ -548,6 +845,7 @@ while true; do
         7)  remove_user     ;;
         8)  renew_user      ;;
         9)  cleanup_expired ;;
+        10) conn_stats      ;;
         11) bw_report       ;;
         12) reset_bandwidth ;;
         13) speed_test      ;;
@@ -556,6 +854,7 @@ while true; do
         16) restore_backup  ;;
         17) change_port     ;;
         18) auto_update     ;;
+        19) set_conn_limit  ;;
         99) uninstall       ;;
         0)  echo -e "  ${G}Bye!${NC}"; exit 0 ;;
         *)  echo -e "${R}  Invalid option: ${choice}${NC}" ;;
