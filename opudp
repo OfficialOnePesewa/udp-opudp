@@ -511,19 +511,27 @@ list_users() {
         echo ""
     }
 
-    printf "  ${OR}%-16s %-18s %-12s %-6s %-6s %-7s %-8s %s${NC}\n" \
-        "USERNAME" "PASSWORD" "EXPIRY" "USED" "LEFT" "CONN" "ONLINE" "STATUS"
+    printf "  ${OR}%-16s %-18s %-12s %-6s %-6s %-10s %-7s %-8s %s${NC}\n" \
+        "USERNAME" "PASSWORD" "EXPIRY" "USED" "LEFT" "QUOTA" "CONN" "ONLINE" "STATUS"
     fire_divider
 
     while IFS=':' read -r u p e bw mc cd; do
         [[ -z "$u" ]] && continue
         [[ -z "$mc" ]] && mc=0
         [[ -z "$cd" ]] && cd="?"
+        [[ -z "$bw" ]] && bw=0
 
-        local dl du conn_disp status online lastseen_epoch
+        local dl du conn_disp status online lastseen_epoch bw_label
         dl=$(days_left "$e")
         du=$(days_used "$cd")
         [[ "$mc" -eq 0 ]] && conn_disp="∞" || conn_disp="${mc}"
+        if [[ "$bw" -eq 0 ]]; then
+            bw_label="∞"
+        elif [[ "$bw" -ge 1024 ]]; then
+            bw_label="$(echo "scale=1; $bw/1024" | bc)GB"
+        else
+            bw_label="${bw}MB"
+        fi
 
         online="${DIM}OFFLINE${NC}"
         local ls_file="${LASTSEEN_DIR}/${u}"
@@ -556,13 +564,13 @@ list_users() {
             du="${du}d"
         fi
 
-        printf "  %-16s %-18s %-12s %-6s %-6s %-7s " \
-            "${u}${is_trial}" "$p" "$e" "$du" "$dl" "$conn_disp"
+        printf "  %-16s %-18s %-12s %-6s %-6s %-10s %-7s " \
+            "${u}${is_trial}" "$p" "$e" "$du" "$dl" "$bw_label" "$conn_disp"
         echo -ne "$online  "
         echo -e "$status"
     done < "$USERS_DB"
     echo ""
-    echo -e "  ${DIM}USED = days since created   LEFT = days until expiry   ⚡ = trial${NC}"
+    echo -e "  ${DIM}USED = days since created   LEFT = days until expiry   QUOTA = data limit   ⚡ = trial${NC}"
     echo -e "  ${DIM}ONLINE = connected in last 5 min (updates when panel is open)${NC}"
 }
 
@@ -635,16 +643,55 @@ add_user() {
         *) max_conn=0 ;;
     esac
 
+    echo ""
+    echo -e "  ${OR}╔══════════════════════════════════════╗${NC}"
+    echo -e "  ${OR}║${GO}   BANDWIDTH / DATA QUOTA             ${OR}║${NC}"
+    echo -e "  ${OR}╠══════════════════════════════════════╣${NC}"
+    echo -e "  ${OR}║${NC}  1)  500 MB      2)  1 GB            ${OR}║${NC}"
+    echo -e "  ${OR}║${NC}  3)  2 GB        4)  5 GB            ${OR}║${NC}"
+    echo -e "  ${OR}║${NC}  5)  10 GB       6)  20 GB           ${OR}║${NC}"
+    echo -e "  ${OR}║${NC}  7)  50 GB       8)  100 GB          ${OR}║${NC}"
+    echo -e "  ${OR}║${NC}  9)  Unlimited   10) Custom (in MB)  ${OR}║${NC}"
+    echo -e "  ${OR}╚══════════════════════════════════════╝${NC}"
+    read -rp "  Choose [1-10]: " bw_choice
+    local bw_quota_mb
+    case $bw_choice in
+        1)  bw_quota_mb=500    ;;
+        2)  bw_quota_mb=1024   ;;
+        3)  bw_quota_mb=2048   ;;
+        4)  bw_quota_mb=5120   ;;
+        5)  bw_quota_mb=10240  ;;
+        6)  bw_quota_mb=20480  ;;
+        7)  bw_quota_mb=51200  ;;
+        8)  bw_quota_mb=102400 ;;
+        9)  bw_quota_mb=0      ;;
+        10)
+            read -rp "  Enter quota in MB (e.g. 3000 = 3GB): " bw_quota_mb
+            if ! [[ "$bw_quota_mb" =~ ^[0-9]+$ ]]; then
+                echo -e "${FR}Invalid. Setting to unlimited.${NC}"
+                bw_quota_mb=0
+            fi
+            ;;
+        *) bw_quota_mb=0 ;;
+    esac
+
     local TODAY
     TODAY=$(date +%Y-%m-%d)
-    echo "${username}:${password}:${expiry}:0:${max_conn}:${TODAY}" >> "$USERS_DB"
+    echo "${username}:${password}:${expiry}:${bw_quota_mb}:${max_conn}:${TODAY}" >> "$USERS_DB"
     rebuild_config
     apply_conn_limits
     systemctl restart "$SVC" 2>/dev/null
 
-    local server_ip conn_label
+    local server_ip conn_label bw_label
     server_ip=$(get_ip)
-    [[ "$max_conn" -eq 0 ]] && conn_label="Unlimited" || conn_label="${max_conn} device(s)"
+    [[ "$max_conn" -eq 0 ]]    && conn_label="Unlimited"              || conn_label="${max_conn} device(s)"
+    if [[ "$bw_quota_mb" -eq 0 ]]; then
+        bw_label="Unlimited"
+    elif [[ "$bw_quota_mb" -ge 1024 ]]; then
+        bw_label="$(echo "scale=1; $bw_quota_mb/1024" | bc) GB"
+    else
+        bw_label="${bw_quota_mb} MB"
+    fi
 
     echo ""
     echo -e "${OR}  ╔═══════════════════════════════════════════════════╗${NC}"
@@ -654,6 +701,7 @@ add_user() {
     echo -e "${OR}  ║${NC}  UDP Password : ${GO}${password}${NC}  ${G}← enter in ZIVPN app${NC}"
     echo -e "${OR}  ║${NC}  Expiry       : ${GO}${expiry}${NC}"
     echo -e "${OR}  ║${NC}  Max Devices  : ${GO}${conn_label}${NC}"
+    echo -e "${OR}  ║${NC}  Data Quota   : ${GO}${bw_label}${NC}"
     echo -e "${OR}  ║${NC}  Created      : ${GO}${TODAY}${NC}"
     echo -e "${OR}  ║${DIM}  (Username '${username}' is for panel records only)${NC}"
     echo -e "${OR}  ╚═══════════════════════════════════════════════════╝${NC}"
@@ -826,17 +874,25 @@ bw_report() {
     if [[ ! -s "$USERS_DB" ]]; then
         echo -e "  ${YW}No users.${NC}"; return
     fi
-    printf "  ${OR}%-16s %-18s %-12s %-6s %-6s %-8s %s${NC}\n" \
-        "USERNAME" "PASSWORD" "EXPIRY" "USED" "LEFT" "CONN" "STATUS"
+    printf "  ${OR}%-16s %-18s %-12s %-6s %-6s %-10s %-8s %s${NC}\n" \
+        "USERNAME" "PASSWORD" "EXPIRY" "USED" "LEFT" "QUOTA" "CONN" "STATUS"
     fire_divider
     while IFS=':' read -r u p e bw mc cd; do
         [[ -z "$u" ]] && continue
         [[ -z "$mc" ]] && mc=0
         [[ -z "$cd" ]] && cd="?"
-        local dl du conn_display status
+        [[ -z "$bw" ]] && bw=0
+        local dl du conn_display status bw_label
         dl=$(days_left "$e")
         du=$(days_used "$cd")
         [[ "$mc" -eq 0 ]] && conn_display="∞" || conn_display="$mc"
+        if [[ "$bw" -eq 0 ]]; then
+            bw_label="∞"
+        elif [[ "$bw" -ge 1024 ]]; then
+            bw_label="$(echo "scale=1; $bw/1024" | bc)GB"
+        else
+            bw_label="${bw}MB"
+        fi
         if is_expired "$e"; then
             status="${FR}EXPIRED${NC}"
             dl="—"
@@ -847,8 +903,8 @@ bw_report() {
                 status="${G}✓ ACTIVE${NC}"
             fi
         fi
-        printf "  %-16s %-18s %-12s %-6s %-6s %-8s " \
-            "$u" "$p" "$e" "${du}d" "${dl}d" "$conn_display"
+        printf "  %-16s %-18s %-12s %-6s %-6s %-10s %-8s " \
+            "$u" "$p" "$e" "${du}d" "${dl}d" "$bw_label" "$conn_display"
         echo -e "$status"
     done < "$USERS_DB"
 }
