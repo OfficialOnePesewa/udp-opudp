@@ -163,8 +163,13 @@ add_trial_user() {
     rebuild_config
     systemctl restart "$SVC" 2>/dev/null
 
-    local server_ip ends_at
-    server_ip=$(get_ip)
+    local server_info server_ip country city flag
+    server_info=$(get_server_info)
+    server_ip=$(echo "$server_info" | cut -d'|' -f1)
+    country=$(echo "$server_info"   | cut -d'|' -f2)
+    city=$(echo "$server_info"      | cut -d'|' -f4)
+    flag=$(echo "$server_info"      | cut -d'|' -f5)
+    local ends_at
     ends_at=$(date -d "@${expiry_epoch}" "+%H:%M:%S")
 
     echo ""
@@ -176,9 +181,32 @@ add_trial_user() {
     echo -e "${OR}  ║${NC}  Duration   : ${GO}${minutes} minutes${NC}"
     echo -e "${OR}  ║${NC}  Expires At : ${FR}${ends_at} today${NC}"
     echo -e "${OR}  ║${NC}  Server IP  : ${GO}${server_ip}${NC}"
+    echo -e "${OR}  ║${NC}  Server Loc : ${GO}${flag} ${country} — ${city}${NC}"
     echo -e "${OR}  ╠═══════════════════════════════════════════════════╣${NC}"
     echo -e "${OR}  ║${DIM}  Auto-removed when expired. No manual cleanup.    ${OR}║${NC}"
     echo -e "${OR}  ╚═══════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${GO}  ┌─────────────────────────────────────────────────┐${NC}"
+    echo -e "${GO}  │  📋  COPY & SHARE — Select all text below:      │${NC}"
+    echo -e "${GO}  └─────────────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "⚡ *ZIVPN Trial Account*"
+    echo -e ""
+    echo -e "🌐 *Server IP*   : \`${server_ip}\`"
+    echo -e "${flag} *Server*      : ${country} (${city})"
+    echo -e "🔑 *Password*    : \`${password}\`"
+    echo -e "⏱  *Duration*    : ${minutes} minutes"
+    echo -e "⏰ *Expires At*  : ${ends_at} today"
+    echo -e ""
+    echo -e "📲 *How to connect:*"
+    echo -e "  1. Open ZIVPN Pro app"
+    echo -e "  2. UDP Server  → ${server_ip}"
+    echo -e "  3. Password    → ${password}"
+    echo -e "  4. Tap Connect ✅"
+    echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${DIM}  ↑ Copy the block above and send to your user via WhatsApp / Telegram${NC}"
     echo ""
 
     echo -e "  ${GO}Watching trial countdown (Ctrl+C to go back)...${NC}"
@@ -227,6 +255,78 @@ get_ip()   { curl -s4 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}';
 get_port() { cat "$PORT_FILE" 2>/dev/null || echo "6000:19999"; }
 today()    { date +%Y-%m-%d; }
 pause()    { echo ""; read -rp "  Press Enter to continue..."; }
+
+# ── Country detection + flag emoji ───────────────────────────
+# Converts a 2-letter ISO country code (e.g. ES) to a flag emoji
+country_code_to_flag() {
+    local code="${1^^}"   # uppercase
+    local flag=""
+    local i
+    for (( i=0; i<${#code}; i++ )); do
+        local char="${code:$i:1}"
+        # Regional Indicator Symbol A = U+1F1E6 = decimal 127462
+        # A=65 in ASCII, so offset = 127462 - 65 = 127397
+        local ord
+        ord=$(printf '%d' "'$char")
+        local codepoint=$(( ord + 127397 ))
+        # Convert codepoint to UTF-8 bytes
+        flag+=$(python3 -c "import sys; sys.stdout.buffer.write(chr(${codepoint}).encode('utf-8'))" 2>/dev/null \
+             || printf "\\U$(printf '%08X' "$codepoint")" 2>/dev/null \
+             || echo "")
+    done
+    echo "$flag"
+}
+
+# Returns: "IP|COUNTRY|COUNTRYCODE|CITY|FLAG"
+get_server_info() {
+    local cache_file="/etc/zivpn/.server_info_cache"
+    local cache_age=3600   # refresh every hour
+
+    # Use cache if fresh
+    if [[ -f "$cache_file" ]]; then
+        local now_t cached_t
+        now_t=$(date +%s)
+        cached_t=$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)
+        if [[ $(( now_t - cached_t )) -lt $cache_age ]]; then
+            cat "$cache_file"
+            return
+        fi
+    fi
+
+    local ip country_code country city flag
+    # Try ip-api.com (free, no key needed)
+    local raw
+    raw=$(curl -s --max-time 5 "http://ip-api.com/json/?fields=status,country,countryCode,city,query" 2>/dev/null)
+
+    if echo "$raw" | grep -q '"status":"success"'; then
+        ip=$(echo "$raw"          | grep -o '"query":"[^"]*"'       | cut -d'"' -f4)
+        country=$(echo "$raw"     | grep -o '"country":"[^"]*"'     | cut -d'"' -f4)
+        country_code=$(echo "$raw"| grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4)
+        city=$(echo "$raw"        | grep -o '"city":"[^"]*"'        | cut -d'"' -f4)
+        flag=$(country_code_to_flag "$country_code")
+    else
+        # Fallback: ipinfo.io
+        raw=$(curl -s --max-time 5 "https://ipinfo.io/json" 2>/dev/null)
+        ip=$(echo "$raw"          | grep -o '"ip": *"[^"]*"'      | cut -d'"' -f4)
+        country_code=$(echo "$raw"| grep -o '"country": *"[^"]*"' | cut -d'"' -f4)
+        city=$(echo "$raw"        | grep -o '"city": *"[^"]*"'    | cut -d'"' -f4)
+        country="$country_code"
+        flag=$(country_code_to_flag "$country_code")
+        [[ -z "$ip" ]] && ip=$(get_ip)
+    fi
+
+    [[ -z "$ip"           ]] && ip=$(get_ip)
+    [[ -z "$country"      ]] && country="Unknown"
+    [[ -z "$country_code" ]] && country_code="??"
+    [[ -z "$city"         ]] && city="Unknown"
+    [[ -z "$flag"         ]] && flag="🌐"
+
+    local result="${ip}|${country}|${country_code}|${city}|${flag}"
+    echo "$result" | tee "$cache_file"
+}
+
+# Helper: clear the server info cache (call after IP changes)
+clear_server_cache() { rm -f "/etc/zivpn/.server_info_cache" 2>/dev/null; }
 
 fire_divider() {
     echo -e "${OR}  ══════════════════════════════════════════════════════════${NC}"
@@ -379,13 +479,17 @@ show_header() {
     check_trials
     refresh_activity
 
-    local svc_st users port ip live_conn trials
+    local svc_st users port ip live_conn trials server_info country city flag
     svc_st=$(systemctl is-active "$SVC" 2>/dev/null)
     users=$(count_active)
     port=$(get_port)
-    ip=$(get_ip)
     live_conn=$(count_live_connections)
     trials=$(count_trials)
+    server_info=$(get_server_info)
+    ip=$(echo "$server_info"      | cut -d'|' -f1)
+    country=$(echo "$server_info" | cut -d'|' -f2)
+    city=$(echo "$server_info"    | cut -d'|' -f4)
+    flag=$(echo "$server_info"    | cut -d'|' -f5)
 
     echo ""
     echo -e "${FR}  ██████╗ ██████╗ ██╗   ██╗██████╗ ██████╗ ${NC}"
@@ -407,6 +511,7 @@ show_header() {
         echo -e "${OR}  ║${NC}  Service : ${FR}✖ OFFLINE${NC}    Live Conns : ${FR}0${NC}        Trials : ${YW}${trials}${NC}"
     fi
     echo -e "${OR}  ║${NC}  Users   : ${GO}${users} active${NC}   IP : ${GO}${ip}${NC}   Ports : ${YW}${port}${NC}"
+    echo -e "${OR}  ║${NC}  Server  : ${GO}${flag} ${country}${NC} ${DIM}(${city})${NC}"
     echo -e "${OR}  ╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -592,14 +697,15 @@ add_user() {
     [[ -z "$password" ]] && echo -e "${FR}Password cannot be empty.${NC}" && return
 
     echo ""
-    echo -e "  ${OR}╔══════════════════════════════╗${NC}"
-    echo -e "  ${OR}║${GO}     EXPIRY OPTIONS           ${OR}║${NC}"
-    echo -e "  ${OR}╠══════════════════════════════╣${NC}"
-    echo -e "  ${OR}║${NC}  1) 1 month   2) 3 months   ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  3) 6 months  4) 1 year     ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  5) Never     6) Custom date ${OR}║${NC}"
-    echo -e "  ${OR}╚══════════════════════════════╝${NC}"
-    read -rp "  Choose [1-6]: " exp_choice
+    echo -e "  ${OR}╔════════════════════════════════════╗${NC}"
+    echo -e "  ${OR}║${GO}        EXPIRY OPTIONS               ${OR}║${NC}"
+    echo -e "  ${OR}╠════════════════════════════════════╣${NC}"
+    echo -e "  ${OR}║${NC}  1) 1 month    2) 3 months          ${OR}║${NC}"
+    echo -e "  ${OR}║${NC}  3) 6 months   4) 1 year            ${OR}║${NC}"
+    echo -e "  ${OR}║${NC}  5) Never      6) Custom days        ${OR}║${NC}"
+    echo -e "  ${OR}║${NC}  7) Custom date (YYYY-MM-DD)         ${OR}║${NC}"
+    echo -e "  ${OR}╚════════════════════════════════════╝${NC}"
+    read -rp "  Choose [1-7]: " exp_choice
     local expiry
     case $exp_choice in
         1) expiry=$(date -d "+1 month"   +%Y-%m-%d) ;;
@@ -608,6 +714,14 @@ add_user() {
         4) expiry=$(date -d "+1 year"    +%Y-%m-%d) ;;
         5) expiry="never" ;;
         6)
+            read -rp "  Enter number of days (e.g. 7, 14, 30): " custom_days
+            if ! [[ "$custom_days" =~ ^[0-9]+$ ]] || [[ "$custom_days" -lt 1 ]]; then
+                echo -e "${FR}Invalid. Must be a whole number greater than 0.${NC}"; return
+            fi
+            expiry=$(date -d "+${custom_days} days" +%Y-%m-%d)
+            echo -e "  ${GO}Expiry set to: ${W}${expiry}${NC} ${DIM}(${custom_days} days from today)${NC}"
+            ;;
+        7)
             read -rp "  Enter date (YYYY-MM-DD): " expiry
             if ! date -d "$expiry" +%Y-%m-%d &>/dev/null; then
                 echo -e "${FR}Invalid date format.${NC}"; return
@@ -682,9 +796,14 @@ add_user() {
     apply_conn_limits
     systemctl restart "$SVC" 2>/dev/null
 
-    local server_ip conn_label bw_label
-    server_ip=$(get_ip)
-    [[ "$max_conn" -eq 0 ]]    && conn_label="Unlimited"              || conn_label="${max_conn} device(s)"
+    local server_ip conn_label bw_label server_info country city flag country_code
+    server_info=$(get_server_info)
+    server_ip=$(echo "$server_info"    | cut -d'|' -f1)
+    country=$(echo "$server_info"      | cut -d'|' -f2)
+    country_code=$(echo "$server_info" | cut -d'|' -f3)
+    city=$(echo "$server_info"         | cut -d'|' -f4)
+    flag=$(echo "$server_info"         | cut -d'|' -f5)
+    [[ "$max_conn" -eq 0 ]]    && conn_label="Unlimited" || conn_label="${max_conn} device(s)"
     if [[ "$bw_quota_mb" -eq 0 ]]; then
         bw_label="Unlimited"
     elif [[ "$bw_quota_mb" -ge 1024 ]]; then
@@ -698,6 +817,7 @@ add_user() {
     echo -e "${OR}  ║${GO}  ✓ USER ADDED SUCCESSFULLY!                       ${OR}║${NC}"
     echo -e "${OR}  ╠═══════════════════════════════════════════════════╣${NC}"
     echo -e "${OR}  ║${NC}  UDP Server   : ${GO}${server_ip}${NC}"
+    echo -e "${OR}  ║${NC}  Server Loc   : ${GO}${flag} ${country} — ${city}${NC}"
     echo -e "${OR}  ║${NC}  UDP Password : ${GO}${password}${NC}  ${G}← enter in ZIVPN app${NC}"
     echo -e "${OR}  ║${NC}  Expiry       : ${GO}${expiry}${NC}"
     echo -e "${OR}  ║${NC}  Max Devices  : ${GO}${conn_label}${NC}"
@@ -705,6 +825,34 @@ add_user() {
     echo -e "${OR}  ║${NC}  Created      : ${GO}${TODAY}${NC}"
     echo -e "${OR}  ║${DIM}  (Username '${username}' is for panel records only)${NC}"
     echo -e "${OR}  ╚═══════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # ── Ready-to-copy share block ──────────────────────────────
+    local dl_label
+    [[ "$expiry" == "never" ]] && dl_label="Never" || dl_label="$expiry"
+
+    echo -e "${GO}  ┌─────────────────────────────────────────────────┐${NC}"
+    echo -e "${GO}  │  📋  COPY & SHARE — Select all text below:      │${NC}"
+    echo -e "${GO}  └─────────────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "🔥 *ZIVPN VPN Account Details*"
+    echo -e ""
+    echo -e "🌐 *Server IP*     : \`${server_ip}\`"
+    echo -e "${flag} *Server*        : ${country} (${city})"
+    echo -e "🔑 *Password*      : \`${password}\`"
+    echo -e "📅 *Expires*       : ${dl_label}"
+    echo -e "📱 *Max Devices*   : ${conn_label}"
+    echo -e "📊 *Data Quota*    : ${bw_label}"
+    echo -e ""
+    echo -e "📲 *How to connect:*"
+    echo -e "  1. Open ZIVPN Pro app"
+    echo -e "  2. UDP Server  → ${server_ip}"
+    echo -e "  3. Password    → ${password}"
+    echo -e "  4. Tap Connect ✅"
+    echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${DIM}  ↑ Copy the block above and send to your user via WhatsApp / Telegram${NC}"
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -746,11 +894,15 @@ renew_user() {
         echo -e "${FR}User '${username}' not found.${NC}"; return
     fi
     echo ""
-    echo -e "  ${OR}New Expiry:${NC}"
-    echo "    1) 1 month    2) 3 months"
-    echo "    3) 6 months   4) 1 year"
-    echo "    5) Never      6) Custom (YYYY-MM-DD)"
-    read -rp "  Choose [1-6]: " exp_choice
+    echo -e "  ${OR}╔════════════════════════════════════╗${NC}"
+    echo -e "  ${OR}║${GO}        NEW EXPIRY OPTIONS           ${OR}║${NC}"
+    echo -e "  ${OR}╠════════════════════════════════════╣${NC}"
+    echo -e "  ${OR}║${NC}  1) 1 month    2) 3 months          ${OR}║${NC}"
+    echo -e "  ${OR}║${NC}  3) 6 months   4) 1 year            ${OR}║${NC}"
+    echo -e "  ${OR}║${NC}  5) Never      6) Custom days        ${OR}║${NC}"
+    echo -e "  ${OR}║${NC}  7) Custom date (YYYY-MM-DD)         ${OR}║${NC}"
+    echo -e "  ${OR}╚════════════════════════════════════╝${NC}"
+    read -rp "  Choose [1-7]: " exp_choice
     local new_expiry
     case $exp_choice in
         1) new_expiry=$(date -d "+1 month"   +%Y-%m-%d) ;;
@@ -759,6 +911,14 @@ renew_user() {
         4) new_expiry=$(date -d "+1 year"    +%Y-%m-%d) ;;
         5) new_expiry="never" ;;
         6)
+            read -rp "  Enter number of days (e.g. 7, 14, 30): " custom_days
+            if ! [[ "$custom_days" =~ ^[0-9]+$ ]] || [[ "$custom_days" -lt 1 ]]; then
+                echo -e "${FR}Invalid. Must be a whole number greater than 0.${NC}"; return
+            fi
+            new_expiry=$(date -d "+${custom_days} days" +%Y-%m-%d)
+            echo -e "  ${GO}Expiry set to: ${W}${new_expiry}${NC} ${DIM}(${custom_days} days from today)${NC}"
+            ;;
+        7)
             read -rp "  Enter date (YYYY-MM-DD): " new_expiry
             if ! date -d "$new_expiry" +%Y-%m-%d &>/dev/null; then
                 echo -e "${FR}Invalid date.${NC}"; return
