@@ -1,0 +1,564 @@
+#!/bin/bash
+# ============================================================
+#  OPUDP — ZIVPN UDP Ultimate Control Panel
+#  Author  : OfficialOnePesewa
+#  GitHub  : https://github.com/OfficialOnePesewa/udp-opudp
+#  Command : opudp
+# ============================================================
+#
+#  CREDENTIAL GUIDE (read this once):
+#  ─────────────────────────────────────────────────────────
+#  USERNAME  → label only (for your records in this panel)
+#  PASSWORD  → what you enter in the ZIVPN Pro app
+#
+#  In the ZIVPN app UDP Tunnel dialog:
+#    UDP Server   = your VPS IP
+#    UDP Password = the PASSWORD you set here
+#  The username is NOT used by the ZIVPN protocol.
+# ============================================================
+
+CONFIG="/etc/zivpn/config.json"
+USERS_DB="/etc/zivpn/users.db"
+PORT_FILE="/etc/zivpn/port_range"
+BACKUP_DIR="/etc/zivpn/backups"
+SVC="zivpn"
+BIN="/usr/local/bin/zivpn"
+LISTEN_PORT="5667"
+PANEL_VERSION="1.0.0"
+GITHUB_RAW="https://raw.githubusercontent.com/OfficialOnePesewa/udp-opudp/main"
+
+# ── Colours ──────────────────────────────────────────────────
+R='\033[0;31m'  ; G='\033[0;32m' ; Y='\033[1;33m'
+C='\033[0;36m'  ; W='\033[1;37m' ; B='\033[0;34m'
+M='\033[0;35m'  ; NC='\033[0m'
+
+# ── Guard ─────────────────────────────────────────────────────
+[[ $EUID -ne 0 ]] && echo -e "${R}Run as root: sudo opudp${NC}" && exit 1
+
+# ── Init ──────────────────────────────────────────────────────
+init() {
+    mkdir -p /etc/zivpn "$BACKUP_DIR"
+    [[ ! -f "$USERS_DB"  ]] && touch "$USERS_DB"
+    [[ ! -f "$PORT_FILE" ]] && echo "6000:19999" > "$PORT_FILE"
+}
+
+# ── Helpers ───────────────────────────────────────────────────
+get_ip()   { curl -s4 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}'; }
+get_port() { cat "$PORT_FILE" 2>/dev/null || echo "6000:19999"; }
+today()    { date +%Y-%m-%d; }
+pause()    { echo ""; read -rp "  Press Enter to continue..."; }
+divider()  { echo -e "${C}──────────────────────────────────────────────────────────────${NC}"; }
+
+is_expired() {
+    local exp="$1"
+    [[ "$exp" == "never" ]] && return 1
+    [[ "$exp" < "$(today)" ]] && return 0
+    return 1
+}
+
+days_left() {
+    local exp="$1"
+    [[ "$exp" == "never" ]] && echo "∞" && return
+    local now_s exp_s
+    now_s=$(date +%s)
+    exp_s=$(date -d "$exp" +%s 2>/dev/null) || { echo "?"; return; }
+    echo $(( (exp_s - now_s) / 86400 ))
+}
+
+count_active() {
+    local n=0
+    while IFS=':' read -r u p e bw; do
+        [[ -z "$u" ]] && continue
+        is_expired "$e" || n=$((n+1))
+    done < "$USERS_DB"
+    echo "$n"
+}
+
+rebuild_config() {
+    local pwds=()
+    while IFS=':' read -r u p e bw; do
+        [[ -z "$u" || -z "$p" ]] && continue
+        is_expired "$e" || pwds+=("\"$p\"")
+    done < "$USERS_DB"
+
+    local plist=""
+    if [[ ${#pwds[@]} -gt 0 ]]; then
+        plist=$(printf '%s,' "${pwds[@]}")
+        plist="${plist%,}"
+    fi
+
+    cat > "$CONFIG" << EOF
+{
+  "listen": ":${LISTEN_PORT}",
+  "cert": "/etc/zivpn/zivpn.crt",
+  "key": "/etc/zivpn/zivpn.key",
+  "obfs": "zivpn",
+  "auth": {
+    "mode": "passwords",
+    "config": [${plist}]
+  }
+}
+EOF
+}
+
+show_header() {
+    clear
+    local svc_st users port ip
+    svc_st=$(systemctl is-active "$SVC" 2>/dev/null)
+    users=$(count_active)
+    port=$(get_port)
+    ip=$(get_ip)
+
+    echo -e "${C}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${C}║${W}       EXPIRY + BANDWIDTH  Ultimate Control Panel             ${C}║${NC}"
+    echo -e "${C}║${C}           User Expiry  •  Limits  •  Stats                   ${C}║${NC}"
+    echo -e "${C}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    if [[ "$svc_st" == "active" ]]; then
+        echo -e "  Service: ${G}active${NC}    Total Users: ${G}${users}${NC}"
+    else
+        echo -e "  Service: ${R}inactive${NC}  Total Users: ${G}${users}${NC}"
+    fi
+    echo -e "  IP: ${C}${ip}${NC}   UDP Port Range: ${Y}${port}${NC}   Panel v${PANEL_VERSION}"
+    echo ""
+}
+
+show_menu() {
+    echo -e "  ${G}1)${NC}  Start ZIVPN              ${G}11)${NC} Bandwidth + Expiry Report"
+    echo -e "  ${G}2)${NC}  Stop ZIVPN               ${G}12)${NC} Reset All Bandwidth"
+    echo -e "  ${G}3)${NC}  Restart ZIVPN            ${G}13)${NC} Speed Test"
+    echo -e "  ${G}4)${NC}  Status                   ${G}14)${NC} Live Logs"
+    echo -e "  ${G}5)${NC}  List Users + Expiry      ${G}15)${NC} Backup All Data"
+    echo -e "  ${G}6)${NC}  Add User (with expiry)   ${G}16)${NC} Restore Backup"
+    echo -e "  ${G}7)${NC}  Remove User              ${G}17)${NC} Change Port Range"
+    echo -e "  ${G}8)${NC}  Renew/Extend User        ${G}18)${NC} Auto-Update ZIVPN"
+    echo -e "  ${G}9)${NC}  Cleanup Expired Users    ${R}99)${NC} UNINSTALL (DANGER)"
+    echo -e "  ${G}0)${NC}  Exit"
+    echo ""
+    echo -ne "${Y}Choose [0-99] ► ${NC}"
+}
+
+start_svc() {
+    echo -e "${Y}Starting ZIVPN...${NC}"
+    systemctl start "$SVC"
+    sleep 1
+    if systemctl is-active --quiet "$SVC"; then
+        echo -e "${G}ZIVPN is now running.${NC}"
+    else
+        echo -e "${R}Failed to start. Check: journalctl -u zivpn -n 20${NC}"
+    fi
+}
+
+stop_svc() {
+    echo -e "${Y}Stopping ZIVPN...${NC}"
+    systemctl stop "$SVC"
+    echo -e "${R}ZIVPN stopped.${NC}"
+}
+
+restart_svc() {
+    echo -e "${Y}Restarting ZIVPN...${NC}"
+    systemctl restart "$SVC"
+    sleep 1
+    if systemctl is-active --quiet "$SVC"; then
+        echo -e "${G}ZIVPN restarted successfully.${NC}"
+    else
+        echo -e "${R}Restart failed. Check: journalctl -u zivpn -n 20${NC}"
+    fi
+}
+
+show_status() {
+    echo -e "${C}═══ ZIVPN Service Status ════════════════════════════════════${NC}"
+    systemctl status "$SVC" --no-pager -l
+    echo ""
+    divider
+    echo -e "  Config file : ${Y}${CONFIG}${NC}"
+    echo -e "  Users DB    : ${Y}${USERS_DB}${NC}"
+    echo -e "  Port file   : ${Y}${PORT_FILE}${NC}"
+    echo -e "  Binary      : ${Y}${BIN}${NC}"
+}
+
+list_users() {
+    echo -e "${C}═══ User List ═══════════════════════════════════════════════${NC}"
+    if [[ ! -s "$USERS_DB" ]]; then
+        echo -e "  ${Y}No users found. Use option 6 to add one.${NC}"
+        return
+    fi
+    printf "\n  %-20s %-22s %-12s %-10s %s\n" "USERNAME" "PASSWORD" "EXPIRY" "DAYS LEFT" "STATUS"
+    divider
+    while IFS=':' read -r u p e bw; do
+        [[ -z "$u" ]] && continue
+        local dl status
+        if is_expired "$e"; then
+            dl="—"
+            status="${R}EXPIRED${NC}"
+        else
+            dl=$(days_left "$e")
+            status="${G}ACTIVE${NC}"
+        fi
+        printf "  %-20s %-22s %-12s %-10s " "$u" "$p" "$e" "$dl"
+        echo -e "$status"
+    done < "$USERS_DB"
+    echo ""
+}
+
+add_user() {
+    echo -e "${C}═══ Add New User ════════════════════════════════════════════${NC}"
+    echo ""
+    read -rp "  Username: " username
+    username=$(echo "$username" | tr -d ' ')
+    [[ -z "$username" ]] && echo -e "${R}Username cannot be empty.${NC}" && return
+    if grep -q "^${username}:" "$USERS_DB" 2>/dev/null; then
+        echo -e "${R}User '${username}' already exists!${NC}"; return
+    fi
+    read -rp "  Password: " password
+    password=$(echo "$password" | tr -d ' ')
+    [[ -z "$password" ]] && echo -e "${R}Password cannot be empty.${NC}" && return
+    echo ""
+    echo -e "  ${W}Expiry Options:${NC}"
+    echo "    1) 1 month    2) 3 months"
+    echo "    3) 6 months   4) 1 year"
+    echo "    5) Never      6) Custom date (YYYY-MM-DD)"
+    read -rp "  Choose [1-6]: " exp_choice
+    case $exp_choice in
+        1) expiry=$(date -d "+1 month"   +%Y-%m-%d) ;;
+        2) expiry=$(date -d "+3 months"  +%Y-%m-%d) ;;
+        3) expiry=$(date -d "+6 months"  +%Y-%m-%d) ;;
+        4) expiry=$(date -d "+1 year"    +%Y-%m-%d) ;;
+        5) expiry="never" ;;
+        6)
+            read -rp "  Enter date (YYYY-MM-DD): " expiry
+            if ! date -d "$expiry" +%Y-%m-%d &>/dev/null; then
+                echo -e "${R}Invalid date format.${NC}"; return
+            fi
+            ;;
+        *) echo -e "${R}Invalid choice.${NC}"; return ;;
+    esac
+    echo "${username}:${password}:${expiry}:0" >> "$USERS_DB"
+    rebuild_config
+    systemctl restart "$SVC" 2>/dev/null
+    local server_ip
+    server_ip=$(get_ip)
+    echo ""
+    echo -e "${G}  ✓ User '${username}' added!${NC}"
+    echo ""
+    echo -e "${C}  ╔═══════════ ZIVPN App Configuration ══════════════╗${NC}"
+    echo -e "${C}  ║${NC}  UDP Server   :  ${Y}${server_ip}${NC}"
+    echo -e "${C}  ║${NC}  UDP Password :  ${Y}${password}${NC}  ${G}← enter this in the app${NC}"
+    echo -e "${C}  ║${NC}  Expiry       :  ${Y}${expiry}${NC}"
+    echo -e "${C}  ║${NC}  (Username '${username}' is for panel only)${NC}"
+    echo -e "${C}  ╚══════════════════════════════════════════════════╝${NC}"
+}
+
+remove_user() {
+    echo -e "${C}═══ Remove User ═════════════════════════════════════════════${NC}"
+    list_users
+    [[ ! -s "$USERS_DB" ]] && return
+    read -rp "  Enter username to remove: " username
+    username=$(echo "$username" | tr -d ' ')
+    if ! grep -q "^${username}:" "$USERS_DB" 2>/dev/null; then
+        echo -e "${R}User '${username}' not found.${NC}"; return
+    fi
+    read -rp "  Confirm remove '${username}'? [y/N]: " confirm
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "  Cancelled." && return
+    sed -i "/^${username}:/d" "$USERS_DB"
+    rebuild_config
+    systemctl restart "$SVC" 2>/dev/null
+    echo -e "${G}  User '${username}' removed and config reloaded.${NC}"
+}
+
+renew_user() {
+    echo -e "${C}═══ Renew / Extend User ═════════════════════════════════════${NC}"
+    list_users
+    [[ ! -s "$USERS_DB" ]] && return
+    read -rp "  Enter username to renew: " username
+    username=$(echo "$username" | tr -d ' ')
+    if ! grep -q "^${username}:" "$USERS_DB" 2>/dev/null; then
+        echo -e "${R}User '${username}' not found.${NC}"; return
+    fi
+    echo ""
+    echo -e "  ${W}New Expiry:${NC}"
+    echo "    1) 1 month    2) 3 months"
+    echo "    3) 6 months   4) 1 year"
+    echo "    5) Never      6) Custom date (YYYY-MM-DD)"
+    read -rp "  Choose [1-6]: " exp_choice
+    case $exp_choice in
+        1) new_expiry=$(date -d "+1 month"   +%Y-%m-%d) ;;
+        2) new_expiry=$(date -d "+3 months"  +%Y-%m-%d) ;;
+        3) new_expiry=$(date -d "+6 months"  +%Y-%m-%d) ;;
+        4) new_expiry=$(date -d "+1 year"    +%Y-%m-%d) ;;
+        5) new_expiry="never" ;;
+        6)
+            read -rp "  Enter date (YYYY-MM-DD): " new_expiry
+            if ! date -d "$new_expiry" +%Y-%m-%d &>/dev/null; then
+                echo -e "${R}Invalid date.${NC}"; return
+            fi
+            ;;
+        *) echo -e "${R}Invalid choice.${NC}"; return ;;
+    esac
+    sed -i "s/^\(${username}:[^:]*\):[^:]*:\(.*\)$/\1:${new_expiry}:\2/" "$USERS_DB"
+    rebuild_config
+    systemctl restart "$SVC" 2>/dev/null
+    echo -e "${G}  '${username}' renewed → expiry: ${new_expiry}${NC}"
+}
+
+cleanup_expired() {
+    echo -e "${C}═══ Cleanup Expired Users ═══════════════════════════════════${NC}"
+    local count=0
+    local tmp
+    tmp=$(mktemp)
+    while IFS=':' read -r u p e bw; do
+        [[ -z "$u" ]] && continue
+        if is_expired "$e"; then
+            echo -e "  ${R}Removing:${NC} ${u} (expired: ${e})"
+            count=$((count + 1))
+        else
+            echo "${u}:${p}:${e}:${bw}" >> "$tmp"
+        fi
+    done < "$USERS_DB"
+    mv "$tmp" "$USERS_DB"
+    rebuild_config
+    systemctl restart "$SVC" 2>/dev/null
+    echo ""
+    echo -e "${G}  Done. Removed ${count} expired user(s).${NC}"
+}
+
+bw_report() {
+    echo -e "${C}═══ Bandwidth + Expiry Report ═══════════════════════════════${NC}"
+    local iface
+    iface=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
+    local rx tx rx_mb tx_mb
+    rx=$(cat /sys/class/net/"$iface"/statistics/rx_bytes 2>/dev/null || echo 0)
+    tx=$(cat /sys/class/net/"$iface"/statistics/tx_bytes 2>/dev/null || echo 0)
+    rx_mb=$(echo "scale=2; $rx/1048576" | bc)
+    tx_mb=$(echo "scale=2; $tx/1048576" | bc)
+    echo ""
+    echo -e "  Interface : ${Y}${iface}${NC}"
+    echo -e "  Total RX  : ${G}${rx_mb} MB${NC}"
+    echo -e "  Total TX  : ${G}${tx_mb} MB${NC}"
+    echo ""
+    divider
+    if [[ ! -s "$USERS_DB" ]]; then
+        echo -e "  ${Y}No users.${NC}"; return
+    fi
+    printf "  %-20s %-22s %-12s %-10s %s\n" "USERNAME" "PASSWORD" "EXPIRY" "DAYS LEFT" "STATUS"
+    divider
+    while IFS=':' read -r u p e bw; do
+        [[ -z "$u" ]] && continue
+        local dl status
+        if is_expired "$e"; then
+            dl="—"
+            status="${R}EXPIRED${NC}"
+        else
+            dl=$(days_left "$e")
+            if [[ "$dl" != "∞" && "$dl" -le 3 ]]; then
+                status="${Y}EXPIRING SOON${NC}"
+            else
+                status="${G}ACTIVE${NC}"
+            fi
+        fi
+        printf "  %-20s %-22s %-12s %-10s " "$u" "$p" "$e" "$dl"
+        echo -e "$status"
+    done < "$USERS_DB"
+    echo ""
+    echo -e "  ${Y}Note: Per-user bandwidth requires ZIVPN Pro API.${NC}"
+    echo -e "  ${Y}Interface totals shown above are server-wide.${NC}"
+}
+
+reset_bandwidth() {
+    echo -e "${C}═══ Reset Bandwidth Counters ════════════════════════════════${NC}"
+    read -rp "  Reset iptables byte/packet counters? [y/N]: " confirm
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "  Cancelled." && return
+    iptables -Z 2>/dev/null
+    echo -e "${G}  iptables counters reset.${NC}"
+}
+
+speed_test() {
+    echo -e "${C}═══ Speed Test ══════════════════════════════════════════════${NC}"
+    if command -v speedtest &>/dev/null; then
+        speedtest
+    elif command -v speedtest-cli &>/dev/null; then
+        speedtest-cli
+    else
+        echo -e "  ${Y}Installing speedtest-cli...${NC}"
+        apt-get install -y -q speedtest-cli 2>/dev/null \
+            || pip3 install speedtest-cli --break-system-packages -q 2>/dev/null
+        if command -v speedtest-cli &>/dev/null; then
+            speedtest-cli
+        else
+            echo -e "  ${Y}Falling back to curl speed test...${NC}"
+            echo ""
+            echo -ne "  Download: "
+            curl -o /dev/null -s -w "%{speed_download}" \
+                http://speedtest.tele2.net/10MB.zip | \
+                awk '{printf "%.2f MB/s\n", $1/1048576}'
+        fi
+    fi
+}
+
+live_logs() {
+    echo -e "${C}═══ Live Logs — Ctrl+C to stop ══════════════════════════════${NC}"
+    echo ""
+    journalctl -u "$SVC" -f --no-pager
+}
+
+backup_data() {
+    echo -e "${C}═══ Backup All Data ═════════════════════════════════════════${NC}"
+    local name="opudp_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+    local path="${BACKUP_DIR}/${name}"
+    tar -czf "$path" /etc/zivpn/ 2>/dev/null
+    local size
+    size=$(du -sh "$path" 2>/dev/null | cut -f1)
+    echo -e "${G}  Backup saved:${NC} ${Y}${path}${NC} (${size})"
+}
+
+restore_backup() {
+    echo -e "${C}═══ Restore Backup ══════════════════════════════════════════${NC}"
+    local files
+    files=$(ls "$BACKUP_DIR"/*.tar.gz 2>/dev/null)
+    if [[ -z "$files" ]]; then
+        echo -e "  ${Y}No backups found in ${BACKUP_DIR}${NC}"; return
+    fi
+    echo ""
+    echo -e "  Available backups:"
+    ls -lh "$BACKUP_DIR"/*.tar.gz 2>/dev/null | awk '{print "  "$9, $5}'
+    echo ""
+    read -rp "  Enter backup filename (e.g. opudp_backup_20241201_120000.tar.gz): " bname
+    local bpath="${BACKUP_DIR}/${bname}"
+    if [[ ! -f "$bpath" ]]; then
+        echo -e "${R}  File not found: ${bpath}${NC}"; return
+    fi
+    read -rp "  Restore from '${bname}'? This overwrites current data [y/N]: " confirm
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "  Cancelled." && return
+    tar -xzf "$bpath" -C / 2>/dev/null
+    rebuild_config
+    systemctl restart "$SVC" 2>/dev/null
+    echo -e "${G}  Restored from ${bname}.${NC}"
+}
+
+change_port() {
+    echo -e "${C}═══ Change UDP Port Range ═══════════════════════════════════${NC}"
+    local current
+    current=$(get_port)
+    local old_start old_end
+    old_start=$(echo "$current" | cut -d: -f1)
+    old_end=$(echo "$current"   | cut -d: -f2)
+    echo -e "  Current range: ${Y}${current}${NC}"
+    echo ""
+    read -rp "  New start port (e.g. 6000): " pstart
+    read -rp "  New end port   (e.g. 19999): " pend
+    if [[ -z "$pstart" || -z "$pend" ]]; then
+        echo -e "${R}  Invalid ports.${NC}"; return
+    fi
+    if ! [[ "$pstart" =~ ^[0-9]+$ && "$pend" =~ ^[0-9]+$ ]]; then
+        echo -e "${R}  Ports must be numbers.${NC}"; return
+    fi
+    if [[ "$pstart" -ge "$pend" ]]; then
+        echo -e "${R}  Start must be less than end.${NC}"; return
+    fi
+    local iface
+    iface=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
+    iptables -t nat -D PREROUTING -i "$iface" -p udp \
+        --dport "${old_start}:${old_end}" \
+        -j DNAT --to-destination ":${LISTEN_PORT}" 2>/dev/null
+    iptables -t nat -A PREROUTING -i "$iface" -p udp \
+        --dport "${pstart}:${pend}" \
+        -j DNAT --to-destination ":${LISTEN_PORT}"
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null
+    ufw delete allow "${old_start}:${old_end}/udp" 2>/dev/null
+    ufw allow "${pstart}:${pend}/udp" 2>/dev/null
+    echo "${pstart}:${pend}" > "$PORT_FILE"
+    echo -e "${G}  Port range changed to ${pstart}:${pend}${NC}"
+}
+
+auto_update() {
+    echo -e "${C}═══ Auto-Update ZIVPN ═══════════════════════════════════════${NC}"
+    local LATEST_URL="https://github.com/zahidbd2/udp-zivpn/releases/latest/download/udp-zivpn-linux-amd64"
+    echo -e "  ${Y}Downloading latest ZIVPN binary...${NC}"
+    systemctl stop "$SVC" 2>/dev/null
+    if wget -q --show-progress "$LATEST_URL" -O "${BIN}.new"; then
+        chmod +x "${BIN}.new"
+        mv "${BIN}.new" "$BIN"
+        systemctl start "$SVC"
+        echo -e "${G}  ZIVPN updated and restarted.${NC}"
+    else
+        echo -e "${R}  Download failed. Restarting existing version.${NC}"
+        rm -f "${BIN}.new"
+        systemctl start "$SVC"
+    fi
+    echo -e ""
+    echo -e "  ${Y}Updating OPUDP panel to latest version...${NC}"
+    local PANEL_URL="${GITHUB_RAW}/opudp"
+    if wget -q "$PANEL_URL" -O /usr/local/bin/opudp.new; then
+        chmod +x /usr/local/bin/opudp.new
+        mv /usr/local/bin/opudp.new /usr/local/bin/opudp
+        echo -e "${G}  OPUDP panel updated. Re-run 'opudp' to use new version.${NC}"
+    else
+        rm -f /usr/local/bin/opudp.new
+        echo -e "${Y}  Panel update skipped (could not reach GitHub).${NC}"
+    fi
+}
+
+uninstall() {
+    echo -e "${R}═══ UNINSTALL ZIVPN + OPUDP (DANGER) ═══════════════════════${NC}"
+    echo ""
+    echo -e "${R}  This will permanently remove:${NC}"
+    echo "    - ZIVPN binary and service"
+    echo "    - All user data (/etc/zivpn/)"
+    echo "    - iptables NAT rules"
+    echo "    - The opudp panel command"
+    echo ""
+    read -rp "  Type 'yes' to confirm uninstall: " confirm
+    [[ "$confirm" != "yes" ]] && echo "  Cancelled." && return
+    local iface port ps pe
+    iface=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
+    port=$(get_port)
+    ps=$(echo "$port" | cut -d: -f1)
+    pe=$(echo "$port" | cut -d: -f2)
+    systemctl stop "$SVC"    2>/dev/null
+    systemctl disable "$SVC" 2>/dev/null
+    rm -f /etc/systemd/system/zivpn.service
+    systemctl daemon-reload  2>/dev/null
+    rm -f "$BIN"
+    iptables -t nat -D PREROUTING -i "$iface" -p udp \
+        --dport "${ps}:${pe}" -j DNAT --to-destination ":${LISTEN_PORT}" 2>/dev/null
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null
+    ufw delete allow "${ps}:${pe}/udp"    2>/dev/null
+    ufw delete allow "${LISTEN_PORT}/udp" 2>/dev/null
+    rm -rf /etc/zivpn
+    rm -f /usr/local/bin/opudp
+    echo ""
+    echo -e "${G}  ZIVPN and OPUDP fully removed.${NC}"
+    exit 0
+}
+
+init
+
+while true; do
+    show_header
+    show_menu
+    read -r choice
+    echo ""
+    case $choice in
+        1)  start_svc       ;;
+        2)  stop_svc        ;;
+        3)  restart_svc     ;;
+        4)  show_status     ;;
+        5)  list_users      ;;
+        6)  add_user        ;;
+        7)  remove_user     ;;
+        8)  renew_user      ;;
+        9)  cleanup_expired ;;
+        11) bw_report       ;;
+        12) reset_bandwidth ;;
+        13) speed_test      ;;
+        14) live_logs       ;;
+        15) backup_data     ;;
+        16) restore_backup  ;;
+        17) change_port     ;;
+        18) auto_update     ;;
+        99) uninstall       ;;
+        0)  echo -e "  ${G}Bye!${NC}"; exit 0 ;;
+        *)  echo -e "${R}  Invalid option: ${choice}${NC}" ;;
+    esac
+    pause
+done
