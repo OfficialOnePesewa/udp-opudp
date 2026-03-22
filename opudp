@@ -4,35 +4,34 @@
 #  Author  : OfficialOnePesewa
 #  GitHub  : https://github.com/OfficialOnePesewa/udp-opudp
 #  Command : opudp
-#  Version : 4.0.0  (True HWID Enforcement Edition)
+#  Version : 5.0.0  (True HWID Enforcement — Native Mode)
 # ============================================================
 #
 #  HOW TRUE HWID ENFORCEMENT WORKS:
 #  ─────────────────────────────────────────────────────────
-#  ZIVPN is switched from "passwords" mode to "external" auth.
-#  On every connection attempt, ZIVPN calls opudp-authd
-#  (a local HTTP server on 127.0.0.1:7777) to validate.
+#  ZIVPN only supports "passwords" auth mode. We exploit this
+#  by making the FULL password = password|HWID combined.
 #
-#  The auth daemon checks THREE things before allowing:
-#    1. Is the password registered?
-#    2. Is the account not expired?
-#    3. Does the HWID match what's stored for this password?
+#  Example:
+#    Admin sets password : abc123
+#    Admin sets HWID     : a1b2c3d4e5f6
+#    ZIVPN config stores : "abc123|a1b2c3d4e5f6"
+#    User types in app   : abc123|a1b2c3d4e5f6
 #
-#  If ANY check fails → connection is DENIED immediately.
-#  An unregistered device with the correct password = DENIED.
+#  Result:
+#    ✓ Correct password + correct HWID  → ALLOWED
+#    ✗ Correct password, no HWID        → DENIED
+#    ✗ Correct password, wrong HWID     → DENIED
+#    ✗ Wrong password entirely          → DENIED
 #
-#  CLIENT SETUP (user must enter in ZIVPN app):
-#    UDP Password field:  mypassword|DEVICE_HWID
-#    Separator: | (pipe character)
+#  No external daemon needed. Works with ALL ZIVPN versions.
 #
-#  HOW TO GET ANDROID HWID:
-#    Method 1: Settings → About Phone → Android ID
-#    Method 2: Dial  *#*#8255#*#*  (Google Talk Service Monitor)
-#    Method 3: Use "Device ID" app from Play Store
-#    Method 4: Run in Termux:  settings get secure android_id
-#
-#  users.db format (v4):
+#  users.db format (v5):
 #  username:password:expiry:bandwidth:max_conn:hwid
+#
+#  NOTE: "password" field is the human-readable part only.
+#        The actual ZIVPN password written to config.json is
+#        password|hwid  (or just password if hwid=unbound)
 # ============================================================
 
 CONFIG="/etc/zivpn/config.json"
@@ -41,22 +40,16 @@ PORT_FILE="/etc/zivpn/port_range"
 BACKUP_DIR="/etc/zivpn/backups"
 SESSIONS_DIR="/etc/zivpn/sessions"
 CONN_LOG="/etc/zivpn/connections.log"
-AUTH_LOG="/etc/zivpn/auth.log"
 SVC="zivpn"
-AUTH_SVC="opudp-auth"
 BIN="/usr/local/bin/zivpn"
-AUTH_BIN="/usr/local/bin/opudp-authd"
-AUTH_SVC_FILE="/etc/systemd/system/opudp-auth.service"
 LISTEN_PORT="5667"
-AUTH_PORT="7777"
-PANEL_VERSION="4.0.0"
+PANEL_VERSION="5.0.0"
 HWID_SEP="|"
 GITHUB_RAW="https://raw.githubusercontent.com/OfficialOnePesewa/udp-opudp/main"
 
 # ── Colours ──────────────────────────────────────────────────
 R='\033[0;31m' ; G='\033[0;32m' ; Y='\033[1;33m'
-C='\033[0;36m' ; W='\033[1;37m' ; B='\033[0;34m'
-M='\033[0;35m' ; NC='\033[0m'
+C='\033[0;36m' ; W='\033[1;37m' ; M='\033[0;35m' ; NC='\033[0m'
 
 # ── Guard ─────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && echo -e "${R}Run as root: sudo opudp${NC}" && exit 1
@@ -67,9 +60,7 @@ init() {
     [[ ! -f "$USERS_DB"  ]] && touch "$USERS_DB"
     [[ ! -f "$PORT_FILE" ]] && echo "6000:19999" > "$PORT_FILE"
     [[ ! -f "$CONN_LOG"  ]] && touch "$CONN_LOG"
-    [[ ! -f "$AUTH_LOG"  ]] && touch "$AUTH_LOG"
     migrate_db
-    ensure_auth_service
 }
 
 # ── Migrate DB ────────────────────────────────────────────────
@@ -78,46 +69,11 @@ migrate_db() {
     tmp=$(mktemp)
     while IFS=':' read -r u p e bw mc hwid; do
         [[ -z "$u" ]] && continue
-        [[ -z "$mc"   ]] && mc=0       && changed=1
+        [[ -z "$mc"   ]] && mc=0           && changed=1
         [[ -z "$hwid" ]] && hwid="unbound" && changed=1
         echo "${u}:${p}:${e}:${bw}:${mc}:${hwid}" >> "$tmp"
     done < "$USERS_DB"
     [[ $changed -eq 1 ]] && mv "$tmp" "$USERS_DB" || rm -f "$tmp"
-}
-
-# ── Ensure auth service is installed ──────────────────────────
-ensure_auth_service() {
-    # Install Python auth daemon systemd service if not present
-    if [[ ! -f "$AUTH_SVC_FILE" ]]; then
-        install_auth_service
-    fi
-}
-
-install_auth_service() {
-    if [[ ! -f "$AUTH_BIN" ]]; then
-        echo -e "${Y}  opudp-authd not found. Run option 21 to install HWID enforcement.${NC}"
-        return
-    fi
-    cat > "$AUTH_SVC_FILE" << EOF
-[Unit]
-Description=OPUDP HWID Auth Daemon
-After=network.target zivpn.service
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/bin/python3 ${AUTH_BIN}
-Restart=always
-RestartSec=2
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable "$AUTH_SVC" 2>/dev/null
-    systemctl start  "$AUTH_SVC" 2>/dev/null
 }
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -143,16 +99,20 @@ days_left() {
     echo $(( (exp_s - now_s) / 86400 ))
 }
 
-auth_mode() {
-    # Returns "external" or "passwords"
-    grep -o '"mode": *"[^"]*"' "$CONFIG" 2>/dev/null | grep -o '"[^"]*"$' | tr -d '"'
-}
-
 count_active() {
     local n=0
     while IFS=':' read -r u p e bw mc hwid; do
         [[ -z "$u" ]] && continue
         is_expired "$e" || n=$((n+1))
+    done < "$USERS_DB"
+    echo "$n"
+}
+
+count_hwid_bound() {
+    local n=0
+    while IFS=':' read -r u p e bw mc hwid; do
+        [[ -z "$u" ]] && continue
+        [[ "$hwid" != "unbound" && -n "$hwid" ]] && n=$((n+1))
     done < "$USERS_DB"
     echo "$n"
 }
@@ -169,46 +129,36 @@ get_connected_ips() {
         awk '{print $5}' | cut -d: -f1 | sort -u
 }
 
-count_hwid_bound() {
-    local n=0
-    while IFS=':' read -r u p e bw mc hwid; do
-        [[ -z "$u" ]] && continue
-        [[ "$hwid" != "unbound" && -n "$hwid" ]] && n=$((n+1))
-    done < "$USERS_DB"
-    echo "$n"
+# ── Build the actual ZIVPN password string ────────────────────
+# If hwid is set → password|hwid
+# If hwid is unbound → just password
+zivpn_password() {
+    local password="$1"
+    local hwid="$2"
+    if [[ "$hwid" == "unbound" || -z "$hwid" ]]; then
+        echo "$password"
+    else
+        echo "${password}${HWID_SEP}${hwid}"
+    fi
 }
 
-# ── Config builders ───────────────────────────────────────────
-rebuild_config_external() {
-    # HWID enforcement mode — ZIVPN calls our auth daemon
-    cat > "$CONFIG" << EOF
-{
-  "listen": ":${LISTEN_PORT}",
-  "cert": "/etc/zivpn/zivpn.crt",
-  "key": "/etc/zivpn/zivpn.key",
-  "obfs": "zivpn",
-  "auth": {
-    "mode": "external",
-    "config": {
-      "addr": "http://127.0.0.1:${AUTH_PORT}/auth"
-    }
-  }
-}
-EOF
-}
-
-rebuild_config_passwords() {
-    # Legacy passwords mode — no HWID enforcement
+# ── Rebuild config.json ───────────────────────────────────────
+rebuild_config() {
     local pwds=()
     while IFS=':' read -r u p e bw mc hwid; do
         [[ -z "$u" || -z "$p" ]] && continue
-        is_expired "$e" || pwds+=("\"$p\"")
+        is_expired "$e" && continue
+        local zp
+        zp=$(zivpn_password "$p" "$hwid")
+        pwds+=("\"${zp}\"")
     done < "$USERS_DB"
+
     local plist=""
     if [[ ${#pwds[@]} -gt 0 ]]; then
         plist=$(printf '%s,' "${pwds[@]}")
         plist="${plist%,}"
     fi
+
     cat > "$CONFIG" << EOF
 {
   "listen": ":${LISTEN_PORT}",
@@ -221,16 +171,6 @@ rebuild_config_passwords() {
   }
 }
 EOF
-}
-
-rebuild_config() {
-    local mode
-    mode=$(auth_mode)
-    if [[ "$mode" == "external" ]]; then
-        rebuild_config_external
-    else
-        rebuild_config_passwords
-    fi
 }
 
 apply_conn_limits() {
@@ -251,116 +191,85 @@ apply_conn_limits() {
 # ── Header ─────────────────────────────────────────────────────
 show_header() {
     clear
-    local svc_st auth_st users port ip live hwid_count mode mode_label
+    local svc_st users port ip live hwid_count
     svc_st=$(systemctl is-active "$SVC" 2>/dev/null)
-    auth_st=$(systemctl is-active "$AUTH_SVC" 2>/dev/null)
     users=$(count_active)
     port=$(get_port)
     ip=$(get_ip)
     live=$(count_live_connections)
     hwid_count=$(count_hwid_bound)
-    mode=$(auth_mode)
-
-    if [[ "$mode" == "external" ]]; then
-        mode_label="${M}HWID-ENFORCED${NC}"
-    else
-        mode_label="${Y}passwords (no HWID)${NC}"
-    fi
 
     echo -e "${C}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${C}║${W}     OPUDP — ZIVPN UDP Control Panel  v${PANEL_VERSION}                 ${C}║${NC}"
-    echo -e "${C}║${C}     True HWID Device Enforcement Edition                     ${C}║${NC}"
+    echo -e "${C}║${M}     True HWID Enforcement — Native Password Mode              ${C}║${NC}"
     echo -e "${C}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    printf "  ZIVPN : "
-    [[ "$svc_st" == "active" ]] && echo -e "${G}active${NC}" || echo -e "${R}inactive${NC}"
-    printf "  Auth  : "
-    [[ "$auth_st" == "active" ]] && echo -e "${G}active${NC} (HWID daemon running)" || echo -e "${R}inactive${NC} ${Y}← run option 21!${NC}"
-    printf "  Mode  : "
-    echo -e "$mode_label"
-    echo -e "  Users : ${G}${users}${NC}   Live: ${G}${live}${NC}   HWID-Bound: ${M}${hwid_count}${NC}   IP: ${C}${ip}${NC}   Port: ${Y}${port}${NC}"
+    printf "  ZIVPN   : "
+    [[ "$svc_st" == "active" ]] \
+        && echo -e "${G}active${NC}" \
+        || echo -e "${R}inactive${NC}"
+    echo -e "  Users   : ${G}${users}${NC}   Live: ${G}${live}${NC}   HWID-Locked: ${M}${hwid_count}${NC}"
+    echo -e "  IP      : ${C}${ip}${NC}   Ports: ${Y}${port}${NC}"
     echo ""
 }
 
 # ── Menu ───────────────────────────────────────────────────────
 show_menu() {
-    echo -e "  ${G}1)${NC}  Start ZIVPN              ${G}11)${NC} Bandwidth + Expiry Report"
-    echo -e "  ${G}2)${NC}  Stop ZIVPN               ${G}12)${NC} Reset All Bandwidth"
-    echo -e "  ${G}3)${NC}  Restart ZIVPN            ${G}13)${NC} Speed Test"
-    echo -e "  ${G}4)${NC}  Status                   ${G}14)${NC} Live Logs"
-    echo -e "  ${G}5)${NC}  List Users + HWID        ${G}15)${NC} Backup All Data"
-    echo -e "  ${G}6)${NC}  Add User                 ${G}16)${NC} Restore Backup"
-    echo -e "  ${G}7)${NC}  Remove User              ${G}17)${NC} Change Port Range"
-    echo -e "  ${G}8)${NC}  Renew/Extend User        ${G}18)${NC} Auto-Update ZIVPN"
-    echo -e "  ${G}9)${NC}  Cleanup Expired Users    ${G}19)${NC} Set Connection Limit"
-    echo -e "  ${G}10)${NC} Connection Stats         ${M}20)${NC} ${M}HWID Management${NC}"
-    echo -e "                             ${M}21)${NC} ${M}HWID Enforcement Setup${NC}"
-    echo -e "                             ${M}22)${NC} ${M}Auth Deny Log (live)${NC}"
-    echo -e "                             ${R}99)${NC} UNINSTALL (DANGER)"
+    echo -e "  ${G}1)${NC}  Start ZIVPN              ${G}12)${NC} Reset Bandwidth"
+    echo -e "  ${G}2)${NC}  Stop ZIVPN               ${G}13)${NC} Speed Test"
+    echo -e "  ${G}3)${NC}  Restart ZIVPN            ${G}14)${NC} Live Logs"
+    echo -e "  ${G}4)${NC}  Status                   ${G}15)${NC} Backup All Data"
+    echo -e "  ${G}5)${NC}  List Users + HWID        ${G}16)${NC} Restore Backup"
+    echo -e "  ${G}6)${NC}  Add User                 ${G}17)${NC} Change Port Range"
+    echo -e "  ${G}7)${NC}  Remove User              ${G}18)${NC} Auto-Update ZIVPN"
+    echo -e "  ${G}8)${NC}  Renew/Extend User        ${G}19)${NC} Set Connection Limit"
+    echo -e "  ${G}9)${NC}  Cleanup Expired Users    ${M}20)${NC} ${M}HWID Management${NC}"
+    echo -e "  ${G}10)${NC} Connection Stats         ${M}21)${NC} ${M}Client Setup Guide${NC}"
+    echo -e "  ${G}11)${NC} Bandwidth Report         ${R}99)${NC} UNINSTALL"
     echo -e "  ${G}0)${NC}  Exit"
     echo ""
     echo -ne "${Y}Choose [0-99] ► ${NC}"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  1) Start
+#  1–4) Service controls
 # ══════════════════════════════════════════════════════════════
 start_svc() {
-    echo -e "${Y}Starting ZIVPN...${NC}"
     systemctl start "$SVC"
     sleep 1
     systemctl is-active --quiet "$SVC" \
-        && echo -e "${G}ZIVPN running.${NC}" \
-        || echo -e "${R}Failed. Check: journalctl -u zivpn -n 20${NC}"
-    if systemctl is-active --quiet "$AUTH_SVC"; then
-        echo -e "${G}Auth daemon running.${NC}"
-    else
-        echo -e "${Y}Auth daemon not running. Starting...${NC}"
-        systemctl start "$AUTH_SVC" 2>/dev/null
-    fi
+        && echo -e "${G}  ZIVPN running.${NC}" \
+        || echo -e "${R}  Failed. Check: journalctl -u zivpn -n 20${NC}"
 }
 
-# ══════════════════════════════════════════════════════════════
-#  2) Stop
-# ══════════════════════════════════════════════════════════════
 stop_svc() {
     systemctl stop "$SVC"
-    echo -e "${R}ZIVPN stopped.${NC}"
+    echo -e "${R}  ZIVPN stopped.${NC}"
 }
 
-# ══════════════════════════════════════════════════════════════
-#  3) Restart
-# ══════════════════════════════════════════════════════════════
 restart_svc() {
-    echo -e "${Y}Restarting ZIVPN + Auth daemon...${NC}"
     systemctl restart "$SVC"
-    systemctl restart "$AUTH_SVC" 2>/dev/null
     sleep 1
     systemctl is-active --quiet "$SVC" \
-        && echo -e "${G}ZIVPN restarted.${NC}" \
-        || echo -e "${R}ZIVPN restart failed.${NC}"
-    systemctl is-active --quiet "$AUTH_SVC" \
-        && echo -e "${G}Auth daemon restarted.${NC}" \
-        || echo -e "${Y}Auth daemon not running.${NC}"
+        && echo -e "${G}  ZIVPN restarted.${NC}" \
+        || echo -e "${R}  Restart failed.${NC}"
 }
 
-# ══════════════════════════════════════════════════════════════
-#  4) Status
-# ══════════════════════════════════════════════════════════════
 show_status() {
-    echo -e "${C}═══ ZIVPN ════════════════════════════════════════════════════${NC}"
+    echo -e "${C}═══ ZIVPN Status ════════════════════════════════════════════${NC}"
     systemctl status "$SVC" --no-pager -l
     echo ""
-    echo -e "${M}═══ OPUDP Auth Daemon ════════════════════════════════════════${NC}"
-    systemctl status "$AUTH_SVC" --no-pager -l 2>/dev/null \
-        || echo -e "  ${Y}Auth daemon service not installed. Use option 21.${NC}"
-    echo ""
     divider
-    echo -e "  Config      : ${Y}${CONFIG}${NC}"
-    echo -e "  Auth mode   : ${Y}$(auth_mode)${NC}"
-    echo -e "  Users DB    : ${Y}${USERS_DB}${NC}"
-    echo -e "  Auth log    : ${Y}${AUTH_LOG}${NC}"
-    echo -e "  Conn log    : ${Y}${CONN_LOG}${NC}"
+    echo -e "  Config   : ${Y}${CONFIG}${NC}"
+    echo -e "  Users DB : ${Y}${USERS_DB}${NC}"
+    echo -e "  Conn Log : ${Y}${CONN_LOG}${NC}"
+    echo ""
+    echo -e "  ${W}Active ZIVPN passwords (including HWID):${NC}"
+    grep '"config"' -A 999 "$CONFIG" | grep -o '"[^"]*"' | grep -v '"config"' | \
+        sed 's/"//g' | while read -r pw; do
+        [[ -z "$pw" || "$pw" == "[" || "$pw" == "]" ]] && continue
+        echo -e "    ${Y}${pw}${NC}"
+    done
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -372,7 +281,7 @@ list_users() {
         echo -e "  ${Y}No users found. Use option 6 to add one.${NC}"
         return
     fi
-    printf "\n  %-16s %-18s %-12s %-6s %-6s %-22s %s\n" \
+    printf "\n  %-16s %-16s %-12s %-6s %-6s %-22s %s\n" \
         "USERNAME" "PASSWORD" "EXPIRY" "DAYS" "CONN" "HWID" "STATUS"
     divider
     while IFS=':' read -r u p e bw mc hwid; do
@@ -395,12 +304,12 @@ list_users() {
         [[ "$hwid" == "unbound" ]] \
             && hwid_display="${Y}unbound${NC}" \
             || hwid_display="${M}${hwid_display}${NC}"
-        printf "  %-16s %-18s %-12s %-6s %-6s " "$u" "$p" "$e" "$dl" "$conn_display"
+        printf "  %-16s %-16s %-12s %-6s %-6s " "$u" "$p" "$e" "$dl" "$conn_display"
         printf "%-22b " "$hwid_display"
         echo -e "$status"
     done < "$USERS_DB"
     echo ""
-    echo -e "  ${M}■${NC} HWID bound   ${Y}■${NC} unbound (no device restriction)"
+    echo -e "  ${M}■${NC} HWID locked   ${Y}■${NC} unbound (any device can connect)"
     echo ""
 }
 
@@ -410,51 +319,44 @@ list_users() {
 add_user() {
     echo -e "${C}═══ Add New User ════════════════════════════════════════════${NC}"
     echo ""
-    local mode; mode=$(auth_mode)
-    if [[ "$mode" == "external" ]]; then
-        echo -e "  ${M}HWID enforcement is ACTIVE.${NC}"
-        echo -e "  The client must enter:  ${Y}password${M}|${Y}HWID${NC}  in the ZIVPN app."
-    else
-        echo -e "  ${Y}HWID enforcement is OFF. Enable it via option 21.${NC}"
-    fi
-    echo ""
 
-    read -rp "  Username: " username
+    read -rp "  Username (label only): " username
     username=$(echo "$username" | tr -d ' ')
-    [[ -z "$username" ]] && echo -e "${R}Empty.${NC}" && return
+    [[ -z "$username" ]] && echo -e "${R}  Empty.${NC}" && return
 
     read -rp "  Password: " password
     password=$(echo "$password" | tr -d ' ')
-    [[ -z "$password" ]] && echo -e "${R}Empty.${NC}" && return
+    [[ -z "$password" ]] && echo -e "${R}  Empty.${NC}" && return
+    # Reject pipe — it's our HWID separator
+    if [[ "$password" == *"${HWID_SEP}"* ]]; then
+        echo -e "${R}  Password cannot contain '|'.${NC}"; return
+    fi
     if grep -q ":${password}:" "$USERS_DB" 2>/dev/null; then
         echo -e "${R}  Password '${password}' already in use!${NC}"; return
-    fi
-    # Reject pipe in password (it's our HWID separator)
-    if [[ "$password" == *"${HWID_SEP}"* ]]; then
-        echo -e "${R}  Password cannot contain '${HWID_SEP}' (it is the HWID separator).${NC}"; return
     fi
 
     echo ""
     echo -e "  ${W}Expiry:${NC}"
     echo "    1) 1 month   2) 3 months  3) 6 months"
     echo "    4) 1 year    5) Never     6) Custom (YYYY-MM-DD)"
-    read -rp "  Choose [1-6]: " exp_choice
-    case $exp_choice in
+    read -rp "  Choose [1-6]: " ec
+    case $ec in
         1) expiry=$(date -d "+1 month"  +%Y-%m-%d) ;;
         2) expiry=$(date -d "+3 months" +%Y-%m-%d) ;;
         3) expiry=$(date -d "+6 months" +%Y-%m-%d) ;;
         4) expiry=$(date -d "+1 year"   +%Y-%m-%d) ;;
         5) expiry="never" ;;
         6) read -rp "  Date (YYYY-MM-DD): " expiry
-           date -d "$expiry" +%Y-%m-%d &>/dev/null || { echo -e "${R}Invalid.${NC}"; return; } ;;
-        *) echo -e "${R}Invalid.${NC}"; return ;;
+           date -d "$expiry" +%Y-%m-%d &>/dev/null \
+               || { echo -e "${R}  Invalid date.${NC}"; return; } ;;
+        *) echo -e "${R}  Invalid.${NC}"; return ;;
     esac
 
     echo ""
     echo -e "  ${W}Connection Limit:${NC}"
     echo "    1) 1 device   2) 2   3) 3   4) 5"
-    echo "    5) 10         6) Unlimited  7) Custom"
-    echo -e "    ${Y}Recommended: 1 per device when HWID is bound${NC}"
+    echo "    5) 10         6) Unlimited   7) Custom"
+    echo -e "    ${Y}Tip: Use 1 when binding to a specific HWID${NC}"
     read -rp "  Choose [1-7]: " cc
     case $cc in
         1) max_conn=1  ;; 2) max_conn=2  ;; 3) max_conn=3  ;;
@@ -466,18 +368,22 @@ add_user() {
 
     echo ""
     echo -e "  ${M}══ HWID Device Binding ══════════════════════════════════════${NC}"
-    echo -e "  Enter the device HWID to bind (or press Enter to skip):"
-    echo -e "  ${Y}Android: Settings → About Phone → Android ID${NC}"
-    echo -e "  ${Y}Termux:  settings get secure android_id${NC}"
+    echo -e "  ${W}How to get Android ID:${NC}"
+    echo -e "    • Settings → About Phone → Android ID"
+    echo -e "    • Termux: ${Y}settings get secure android_id${NC}"
+    echo -e "    • Dial:   ${Y}*#*#8255#*#*${NC}"
+    echo ""
+    echo -e "  Enter HWID to lock this account to one device,"
+    echo -e "  or press Enter to skip (any device can connect):"
     read -rp "  HWID: " hwid
     hwid=$(echo "$hwid" | tr -d ' ')
     [[ -z "$hwid" ]] && hwid="unbound"
     if [[ "$hwid" == *"${HWID_SEP}"* ]]; then
-        echo -e "${R}  HWID cannot contain '${HWID_SEP}'.${NC}"; return
+        echo -e "${R}  HWID cannot contain '|'.${NC}"; return
     fi
     if [[ "$hwid" != "unbound" ]] && grep -q ":${hwid}$" "$USERS_DB" 2>/dev/null; then
-        local dupe_owner; dupe_owner=$(grep ":${hwid}$" "$USERS_DB" | cut -d: -f1 | head -1)
-        echo -e "${Y}  Warning: HWID already registered to '${dupe_owner}'.${NC}"
+        local dupe; dupe=$(grep ":${hwid}$" "$USERS_DB" | cut -d: -f1 | head -1)
+        echo -e "${Y}  Warning: HWID already registered to '${dupe}'.${NC}"
         read -rp "  Continue? [y/N]: " dok
         [[ "$dok" != "y" && "$dok" != "Y" ]] && echo "  Cancelled." && return
     fi
@@ -487,27 +393,23 @@ add_user() {
     apply_conn_limits
     systemctl restart "$SVC" 2>/dev/null
 
-    local server_ip; server_ip=$(get_ip)
-    local conn_label; [[ "$max_conn" -eq 0 ]] && conn_label="∞" || conn_label="${max_conn}"
-    local mode; mode=$(auth_mode)
+    local server_ip zp conn_label
+    server_ip=$(get_ip)
+    zp=$(zivpn_password "$password" "$hwid")
+    [[ "$max_conn" -eq 0 ]] && conn_label="∞" || conn_label="${max_conn}"
 
     echo ""
     echo -e "${G}  ✓ User '${username}' added!${NC}"
     echo ""
-    echo -e "${C}  ╔═══════════ ZIVPN App Configuration ══════════════════╗${NC}"
+    echo -e "${C}  ╔════════════ ZIVPN App Configuration ═════════════════╗${NC}"
     echo -e "${C}  ║${NC}  UDP Server   :  ${Y}${server_ip}${NC}"
-    if [[ "$mode" == "external" && "$hwid" != "unbound" ]]; then
-        echo -e "${C}  ║${NC}  UDP Password :  ${Y}${password}${M}|${hwid}${NC}"
-        echo -e "${C}  ║${NC}               ${M}  ↑ Enter EXACTLY as shown (with |)${NC}"
-    else
-        echo -e "${C}  ║${NC}  UDP Password :  ${Y}${password}${NC}"
-        if [[ "$mode" == "external" && "$hwid" == "unbound" ]]; then
-            echo -e "${C}  ║${NC}  ${Y}Note: No HWID bound — any HWID accepted for this entry${NC}"
-        fi
+    echo -e "${C}  ║${NC}  UDP Password :  ${Y}${zp}${NC}"
+    if [[ "$hwid" != "unbound" ]]; then
+        echo -e "${C}  ║${NC}               ${M}  ↑ Includes HWID — copy EXACTLY${NC}"
     fi
     echo -e "${C}  ║${NC}  Expiry       :  ${Y}${expiry}${NC}"
     echo -e "${C}  ║${NC}  Max Devices  :  ${Y}${conn_label}${NC}"
-    echo -e "${C}  ║${NC}  HWID         :  ${M}${hwid}${NC}"
+    echo -e "${C}  ║${NC}  HWID Locked  :  ${M}${hwid}${NC}"
     echo -e "${C}  ╚══════════════════════════════════════════════════════╝${NC}"
 }
 
@@ -518,39 +420,32 @@ remove_user() {
     echo -e "${C}═══ Remove User ═════════════════════════════════════════════${NC}"
     list_users
     [[ ! -s "$USERS_DB" ]] && return
-    echo -e "  ${Y}Enter username to remove all their entries,${NC}"
-    echo -e "  ${Y}or username:password to remove a specific device entry.${NC}"
+    echo -e "  Enter username to remove all entries,"
+    echo -e "  or username:password for a specific device entry."
     read -rp "  Input: " input
     input=$(echo "$input" | tr -d ' ')
     [[ -z "$input" ]] && echo "  Cancelled." && return
 
     if [[ "$input" == *:* ]]; then
-        local uname tpass
-        uname=$(echo "$input" | cut -d: -f1)
-        tpass=$(echo "$input" | cut -d: -f2)
-        if ! grep -q "^${uname}:${tpass}:" "$USERS_DB" 2>/dev/null; then
-            echo -e "${R}  Entry not found.${NC}"; return
-        fi
-        read -rp "  Remove device entry for '${uname}' (pass=${tpass})? [y/N]: " c
+        local un tp
+        un=$(echo "$input" | cut -d: -f1)
+        tp=$(echo "$input" | cut -d: -f2)
+        grep -q "^${un}:${tp}:" "$USERS_DB" \
+            || { echo -e "${R}  Entry not found.${NC}"; return; }
+        read -rp "  Remove this device entry? [y/N]: " c
         [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && return
-        sed -i "/^${uname}:${tpass}:/d" "$USERS_DB"
-        rm -f "${SESSIONS_DIR}/${tpass}.sessions" 2>/dev/null
+        sed -i "/^${un}:${tp}:/d" "$USERS_DB"
         echo -e "${G}  Device entry removed.${NC}"
     else
-        if ! grep -q "^${input}:" "$USERS_DB" 2>/dev/null; then
-            echo -e "${R}  User '${input}' not found.${NC}"; return
-        fi
+        grep -q "^${input}:" "$USERS_DB" \
+            || { echo -e "${R}  User not found.${NC}"; return; }
         local cnt; cnt=$(grep -c "^${input}:" "$USERS_DB")
         read -rp "  Remove ALL ${cnt} entries for '${input}'? [y/N]: " c
         [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && return
-        while IFS=':' read -r u p e bw mc hwid; do
-            [[ "$u" == "$input" ]] && rm -f "${SESSIONS_DIR}/${p}.sessions" 2>/dev/null
-        done < "$USERS_DB"
         sed -i "/^${input}:/d" "$USERS_DB"
         echo -e "${G}  All entries for '${input}' removed.${NC}"
     fi
-    rebuild_config
-    apply_conn_limits
+    rebuild_config; apply_conn_limits
     systemctl restart "$SVC" 2>/dev/null
 }
 
@@ -563,7 +458,7 @@ renew_user() {
     [[ ! -s "$USERS_DB" ]] && return
     read -rp "  Username to renew (all devices): " username
     username=$(echo "$username" | tr -d ' ')
-    grep -q "^${username}:" "$USERS_DB" 2>/dev/null || { echo -e "${R}Not found.${NC}"; return; }
+    grep -q "^${username}:" "$USERS_DB" || { echo -e "${R}  Not found.${NC}"; return; }
     echo ""
     echo -e "  ${W}New Expiry:${NC}"
     echo "    1) 1 month   2) 3 months  3) 6 months"
@@ -576,8 +471,9 @@ renew_user() {
         4) ne=$(date -d "+1 year"   +%Y-%m-%d) ;;
         5) ne="never" ;;
         6) read -rp "  Date: " ne
-           date -d "$ne" +%Y-%m-%d &>/dev/null || { echo -e "${R}Invalid.${NC}"; return; } ;;
-        *) echo -e "${R}Invalid.${NC}"; return ;;
+           date -d "$ne" +%Y-%m-%d &>/dev/null \
+               || { echo -e "${R}  Invalid.${NC}"; return; } ;;
+        *) echo -e "${R}  Invalid.${NC}"; return ;;
     esac
     local tmp; tmp=$(mktemp)
     while IFS=':' read -r u p e bw mc hwid; do
@@ -601,8 +497,7 @@ cleanup_expired() {
     while IFS=':' read -r u p e bw mc hwid; do
         [[ -z "$u" ]] && continue
         if is_expired "$e"; then
-            echo -e "  ${R}Removing:${NC} ${u} [${hwid}] expired ${e}"
-            rm -f "${SESSIONS_DIR}/${p}.sessions" 2>/dev/null
+            echo -e "  ${R}Removing:${NC} ${u} [hwid:${hwid}] expired ${e}"
             count=$((count+1))
         else
             echo "${u}:${p}:${e}:${bw}:${mc}:${hwid}" >> "$tmp"
@@ -621,7 +516,6 @@ conn_stats() {
     echo -e "${C}═══ Connection Stats ════════════════════════════════════════${NC}"
     echo ""
     echo -e "  Live connections : ${G}$(count_live_connections)${NC}"
-    echo -e "  Auth mode        : $(auth_mode)"
     echo ""
     local ips; ips=$(get_connected_ips)
     if [[ -n "$ips" ]]; then
@@ -632,81 +526,89 @@ conn_stats() {
     fi
     echo ""
     divider
-    printf "\n  %-16s %-18s %-6s %-22s %s\n" "USERNAME" "PASSWORD" "CONN" "HWID" "STATUS"
+    printf "\n  %-16s %-16s %-6s %-22s %s\n" \
+        "USERNAME" "PASSWORD" "CONN" "HWID" "STATUS"
     divider
     while IFS=':' read -r u p e bw mc hwid; do
         [[ -z "$u" ]] && continue
         [[ -z "$mc"   ]] && mc=0
         [[ -z "$hwid" ]] && hwid="unbound"
-        local cd hs
+        local cd hs cs
         [[ "$mc" -eq 0 ]] && cd="∞" || cd="$mc"
         [[ ${#hwid} -gt 20 ]] && hs="${hwid:0:17}..." || hs="$hwid"
-        local cs
         is_expired "$e" && cs="${R}EXPIRED${NC}" || cs="${G}ACTIVE${NC}"
-        printf "  %-16s %-18s %-6s %-22s " "$u" "$p" "$cd" "$hs"
+        printf "  %-16s %-16s %-6s %-22s " "$u" "$p" "$cd" "$hs"
         echo -e "$cs"
     done < "$USERS_DB"
     echo ""
 }
 
 # ══════════════════════════════════════════════════════════════
-#  11–16  (bandwidth, reset, speedtest, logs, backup, restore)
+#  11) Bandwidth Report
 # ══════════════════════════════════════════════════════════════
 bw_report() {
-    echo -e "${C}═══ Bandwidth + Expiry Report ═══════════════════════════════${NC}"
+    echo -e "${C}═══ Bandwidth Report ════════════════════════════════════════${NC}"
     local iface; iface=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
     local rx tx
     rx=$(cat /sys/class/net/"$iface"/statistics/rx_bytes 2>/dev/null || echo 0)
     tx=$(cat /sys/class/net/"$iface"/statistics/tx_bytes 2>/dev/null || echo 0)
-    echo -e "  RX: ${G}$(echo "scale=2; $rx/1048576" | bc) MB${NC}   TX: ${G}$(echo "scale=2; $tx/1048576" | bc) MB${NC}   Interface: ${Y}${iface}${NC}"
+    echo -e "  RX : ${G}$(echo "scale=2; $rx/1048576" | bc) MB${NC}"
+    echo -e "  TX : ${G}$(echo "scale=2; $tx/1048576" | bc) MB${NC}"
+    echo -e "  IF : ${Y}${iface}${NC}"
     echo ""
     list_users
 }
 
+# ══════════════════════════════════════════════════════════════
+#  12) Reset Bandwidth
+# ══════════════════════════════════════════════════════════════
 reset_bandwidth() {
-    echo -e "${C}═══ Reset Bandwidth Counters ════════════════════════════════${NC}"
     read -rp "  Reset iptables counters? [y/N]: " c
     [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && return
     iptables -Z 2>/dev/null && echo -e "${G}  Counters reset.${NC}"
 }
 
+# ══════════════════════════════════════════════════════════════
+#  13) Speed Test
+# ══════════════════════════════════════════════════════════════
 speed_test() {
     echo -e "${C}═══ Speed Test ══════════════════════════════════════════════${NC}"
-    if command -v speedtest-cli &>/dev/null; then
-        speedtest-cli
-    else
-        apt-get install -y -q speedtest-cli 2>/dev/null
-        command -v speedtest-cli &>/dev/null && speedtest-cli || {
-            echo -ne "  Download: "
-            curl -o /dev/null -s -w "%{speed_download}" \
-                http://speedtest.tele2.net/10MB.zip | \
-                awk '{printf "%.2f MB/s\n", $1/1048576}'
-        }
-    fi
+    command -v speedtest-cli &>/dev/null || apt-get install -y -q speedtest-cli 2>/dev/null
+    command -v speedtest-cli &>/dev/null && speedtest-cli || {
+        echo -ne "  Download: "
+        curl -o /dev/null -s -w "%{speed_download}" \
+            http://speedtest.tele2.net/10MB.zip | \
+            awk '{printf "%.2f MB/s\n", $1/1048576}'
+    }
 }
 
+# ══════════════════════════════════════════════════════════════
+#  14) Live Logs
+# ══════════════════════════════════════════════════════════════
 live_logs() {
     echo -e "${C}═══ Live Logs — Ctrl+C to stop ══════════════════════════════${NC}"
     journalctl -u "$SVC" -f --no-pager
 }
 
+# ══════════════════════════════════════════════════════════════
+#  15) Backup
+# ══════════════════════════════════════════════════════════════
 backup_data() {
-    echo -e "${C}═══ Backup All Data ═════════════════════════════════════════${NC}"
     local f="${BACKUP_DIR}/opudp_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
     tar -czf "$f" /etc/zivpn/ 2>/dev/null
     echo -e "${G}  Saved: ${Y}${f}${NC} ($(du -sh "$f" 2>/dev/null | cut -f1))"
 }
 
+# ══════════════════════════════════════════════════════════════
+#  16) Restore Backup
+# ══════════════════════════════════════════════════════════════
 restore_backup() {
-    echo -e "${C}═══ Restore Backup ══════════════════════════════════════════${NC}"
-    ls "$BACKUP_DIR"/*.tar.gz 2>/dev/null || { echo -e "  ${Y}No backups found.${NC}"; return; }
-    echo ""
-    ls -lh "$BACKUP_DIR"/*.tar.gz | awk '{print "  "$9, $5}'
-    echo ""
+    ls "$BACKUP_DIR"/*.tar.gz 2>/dev/null || { echo -e "  ${Y}No backups.${NC}"; return; }
+    echo ""; ls -lh "$BACKUP_DIR"/*.tar.gz | awk '{print "  "$9, $5}'; echo ""
     read -rp "  Filename: " bn
     local bp="${BACKUP_DIR}/${bn}"
     [[ ! -f "$bp" ]] && echo -e "${R}  Not found.${NC}" && return
-    read -rp "  Restore '${bn}'? Overwrites all data [y/N]: " c
+    read -rp "  Restore '${bn}'? [y/N]: " c
     [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && return
     tar -xzf "$bp" -C / 2>/dev/null
     migrate_db; rebuild_config; apply_conn_limits
@@ -718,19 +620,18 @@ restore_backup() {
 #  17) Change Port Range
 # ══════════════════════════════════════════════════════════════
 change_port() {
-    echo -e "${C}═══ Change UDP Port Range ═══════════════════════════════════${NC}"
     local cur; cur=$(get_port)
     local os oe; os=$(echo "$cur"|cut -d: -f1); oe=$(echo "$cur"|cut -d: -f2)
     echo -e "  Current: ${Y}${cur}${NC}"
     read -rp "  New start: " ps; read -rp "  New end: " pe
     [[ -z "$ps" || -z "$pe" ]] && echo -e "${R}  Invalid.${NC}" && return
     [[ ! "$ps" =~ ^[0-9]+$ || ! "$pe" =~ ^[0-9]+$ ]] && echo -e "${R}  Not numbers.${NC}" && return
-    [[ "$ps" -ge "$pe" ]] && echo -e "${R}  Start must be < end.${NC}" && return
+    [[ "$ps" -ge "$pe" ]] && echo -e "${R}  Start must be less than end.${NC}" && return
     local iface; iface=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
-    iptables -t nat -D PREROUTING -i "$iface" -p udp --dport "${os}:${oe}" \
-        -j DNAT --to-destination ":${LISTEN_PORT}" 2>/dev/null
-    iptables -t nat -A PREROUTING -i "$iface" -p udp --dport "${ps}:${pe}" \
-        -j DNAT --to-destination ":${LISTEN_PORT}"
+    iptables -t nat -D PREROUTING -i "$iface" -p udp \
+        --dport "${os}:${oe}" -j DNAT --to-destination ":${LISTEN_PORT}" 2>/dev/null
+    iptables -t nat -A PREROUTING -i "$iface" -p udp \
+        --dport "${ps}:${pe}" -j DNAT --to-destination ":${LISTEN_PORT}"
     iptables-save > /etc/iptables/rules.v4 2>/dev/null
     ufw delete allow "${os}:${oe}/udp" 2>/dev/null
     ufw allow "${ps}:${pe}/udp" 2>/dev/null
@@ -742,33 +643,38 @@ change_port() {
 #  18) Auto-Update
 # ══════════════════════════════════════════════════════════════
 auto_update() {
-    echo -e "${C}═══ Auto-Update ZIVPN ═══════════════════════════════════════${NC}"
+    echo -e "${C}═══ Auto-Update ═════════════════════════════════════════════${NC}"
     systemctl stop "$SVC" 2>/dev/null
     wget -q --show-progress \
         "https://github.com/zahidbd2/udp-zivpn/releases/latest/download/udp-zivpn-linux-amd64" \
         -O "${BIN}.new" \
         && chmod +x "${BIN}.new" && mv "${BIN}.new" "$BIN" \
-        && echo -e "${G}  ZIVPN updated.${NC}" \
+        && echo -e "${G}  ZIVPN binary updated.${NC}" \
         || { rm -f "${BIN}.new"; echo -e "${R}  Download failed.${NC}"; }
     systemctl start "$SVC"
+    echo ""
+    wget -q "${GITHUB_RAW}/opudp" -O /usr/local/bin/opudp.new 2>/dev/null \
+        && chmod +x /usr/local/bin/opudp.new \
+        && mv /usr/local/bin/opudp.new /usr/local/bin/opudp \
+        && echo -e "${G}  OPUDP panel updated. Re-run 'opudp'.${NC}" \
+        || echo -e "${Y}  Panel update skipped.${NC}"
 }
 
 # ══════════════════════════════════════════════════════════════
 #  19) Set Connection Limit
 # ══════════════════════════════════════════════════════════════
 set_conn_limit() {
-    echo -e "${C}═══ Set Connection Limit ════════════════════════════════════${NC}"
     list_users
     [[ ! -s "$USERS_DB" ]] && return
-    read -rp "  Password of entry to update: " tp
+    read -rp "  Enter password of entry to update: " tp
     tp=$(echo "$tp" | tr -d ' ')
-    grep -q ":${tp}:" "$USERS_DB" 2>/dev/null || { echo -e "${R}  Not found.${NC}"; return; }
+    grep -q ":${tp}:" "$USERS_DB" || { echo -e "${R}  Not found.${NC}"; return; }
     echo "    1)1  2)2  3)3  4)5  5)10  6)Unlimited  7)Custom"
     read -rp "  Choose: " cc
     case $cc in
         1) nl=1;; 2) nl=2;; 3) nl=3;; 4) nl=5;; 5) nl=10;; 6) nl=0;;
         7) read -rp "  Number: " nl; [[ ! "$nl" =~ ^[0-9]+$ ]] && nl=0;;
-        *) echo -e "${R}Invalid.${NC}"; return;;
+        *) echo -e "${R}  Invalid.${NC}"; return;;
     esac
     local tmp; tmp=$(mktemp)
     while IFS=':' read -r u p e bw mc hwid; do
@@ -780,7 +686,7 @@ set_conn_limit() {
     mv "$tmp" "$USERS_DB"
     apply_conn_limits
     local lb; [[ "$nl" -eq 0 ]] && lb="Unlimited" || lb="${nl}"
-    echo -e "${G}  Connection limit set to: ${lb}${NC}"
+    echo -e "${G}  Limit set to: ${lb}${NC}"
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -794,24 +700,24 @@ hwid_menu() {
         echo -e "${M}╚══════════════════════════════════════════════════════════════╝${NC}"
         echo ""
         echo -e "  ${M}a)${NC} List all HWID bindings"
-        echo -e "  ${M}b)${NC} Bind / update HWID for an entry (by password)"
-        echo -e "  ${M}c)${NC} Add new device entry for existing user"
+        echo -e "  ${M}b)${NC} Bind / update HWID for an entry"
+        echo -e "  ${M}c)${NC} Add new device for existing user"
         echo -e "  ${M}d)${NC} Remove / unbind HWID"
         echo -e "  ${M}e)${NC} Search by HWID"
-        echo -e "  ${M}f)${NC} Show what client should type in ZIVPN app"
-        echo -e "  ${M}g)${NC} Export HWID list to file"
+        echo -e "  ${M}f)${NC} Show client connection strings"
+        echo -e "  ${M}g)${NC} Export HWID list"
         echo -e "  ${M}0)${NC} Back"
         echo ""
         echo -ne "${M}Choose ► ${NC}"
         read -r hc; echo ""
         case "$hc" in
-            a) hwid_list_all ;;
-            b) hwid_bind ;;
-            c) hwid_add_device ;;
-            d) hwid_unbind ;;
-            e) hwid_search ;;
-            f) hwid_show_client_string ;;
-            g) hwid_export ;;
+            a) hwid_list_all    ;;
+            b) hwid_bind        ;;
+            c) hwid_add_device  ;;
+            d) hwid_unbind      ;;
+            e) hwid_search      ;;
+            f) hwid_client_strings ;;
+            g) hwid_export      ;;
             0) break ;;
             *) echo -e "${R}  Invalid.${NC}" ;;
         esac
@@ -822,35 +728,42 @@ hwid_menu() {
 hwid_list_all() {
     echo -e "${M}═══ All HWID Bindings ═══════════════════════════════════════${NC}"
     [[ ! -s "$USERS_DB" ]] && echo -e "  ${Y}No users.${NC}" && return
-    local bound=0 unbound_count=0
-    printf "\n  %-16s %-18s %-12s %-6s %s\n" "USERNAME" "PASSWORD" "EXPIRY" "CONN" "HWID"
+    local bound=0 unbound_c=0
+    printf "\n  %-16s %-16s %-12s %-6s %s\n" \
+        "USERNAME" "PASSWORD" "EXPIRY" "CONN" "HWID"
     divider
     while IFS=':' read -r u p e bw mc hwid; do
         [[ -z "$u" ]] && continue
         [[ -z "$hwid" ]] && hwid="unbound"
         [[ -z "$mc"   ]] && mc=0
-        local cd; [[ "$mc" -eq 0 ]] && cd="∞" || cd="$mc"
-        local el; is_expired "$e" && el="${R}[EXP]${NC}" || el=""
-        printf "  %-16s %-18s %-12s %-6s " "$u" "$p" "$e" "$cd"
+        local cd el zp
+        [[ "$mc" -eq 0 ]] && cd="∞" || cd="$mc"
+        is_expired "$e" && el="${R}[EXP]${NC}" || el=""
+        zp=$(zivpn_password "$p" "$hwid")
+        printf "  %-16s %-16s %-12s %-6s " "$u" "$p" "$e" "$cd"
         if [[ "$hwid" == "unbound" ]]; then
-            echo -e "${Y}unbound${NC} $el"; unbound_count=$((unbound_count+1))
+            echo -e "${Y}unbound${NC} $el"
+            unbound_c=$((unbound_c+1))
         else
-            echo -e "${M}${hwid}${NC} $el"; bound=$((bound+1))
+            echo -e "${M}${hwid}${NC} $el"
+            bound=$((bound+1))
         fi
     done < "$USERS_DB"
     echo ""
-    echo -e "  ${M}Bound: ${bound}${NC}   ${Y}Unbound: ${unbound_count}${NC}"
-    [[ "$unbound_count" -gt 0 ]] && echo -e "  ${Y}⚠ Unbound entries have NO device restriction.${NC}"
+    echo -e "  ${M}HWID-Locked: ${bound}${NC}   ${Y}Unbound: ${unbound_c}${NC}"
+    [[ "$unbound_c" -gt 0 ]] && \
+        echo -e "  ${Y}⚠ Unbound entries accept connections from ANY device.${NC}"
 }
 
 hwid_bind() {
-    echo -e "${M}═══ Bind HWID ═══════════════════════════════════════════════${NC}"
+    echo -e "${M}═══ Bind / Update HWID ══════════════════════════════════════${NC}"
     hwid_list_all; echo ""
     read -rp "  Enter PASSWORD of entry to bind: " tp
     tp=$(echo "$tp" | tr -d ' ')
-    grep -q ":${tp}:" "$USERS_DB" 2>/dev/null || { echo -e "${R}  Not found.${NC}"; return; }
-    local cu; cu=$(grep ":${tp}:" "$USERS_DB" | cut -d: -f6)
-    local uu; uu=$(grep ":${tp}:" "$USERS_DB" | cut -d: -f1)
+    grep -q ":${tp}:" "$USERS_DB" || { echo -e "${R}  Not found.${NC}"; return; }
+    local cu uu
+    cu=$(grep ":${tp}:" "$USERS_DB" | cut -d: -f6)
+    uu=$(grep ":${tp}:" "$USERS_DB" | cut -d: -f1)
     echo -e "  User: ${G}${uu}${NC}   Current HWID: ${Y}${cu:-unbound}${NC}"
     read -rp "  New HWID: " nh
     nh=$(echo "$nh" | tr -d ' ')
@@ -864,8 +777,11 @@ hwid_bind() {
             || echo "${u}:${p}:${e}:${bw}:${mc}:${hwid}" >> "$tmp"
     done < "$USERS_DB"
     mv "$tmp" "$USERS_DB"
-    echo -e "${G}  ✓ HWID bound: ${M}${nh}${NC}"
-    echo -e "  ${Y}Client must now enter: ${Y}${tp}${M}|${nh}${NC}${Y} in ZIVPN app.${NC}"
+    rebuild_config
+    systemctl restart "$SVC" 2>/dev/null
+    local zp; zp=$(zivpn_password "$tp" "$nh")
+    echo -e "${G}  ✓ HWID bound and config updated!${NC}"
+    echo -e "  Client must now type in ZIVPN app: ${Y}${zp}${NC}"
 }
 
 hwid_add_device() {
@@ -873,12 +789,12 @@ hwid_add_device() {
     list_users
     read -rp "  Username: " username
     username=$(echo "$username" | tr -d ' ')
-    grep -q "^${username}:" "$USERS_DB" 2>/dev/null || { echo -e "${R}  Not found.${NC}"; return; }
+    grep -q "^${username}:" "$USERS_DB" || { echo -e "${R}  Not found.${NC}"; return; }
     local inh; inh=$(grep "^${username}:" "$USERS_DB" | head -1 | cut -d: -f3)
     read -rp "  New device password: " np
     np=$(echo "$np" | tr -d ' ')
     [[ -z "$np" ]] && echo -e "${R}  Empty.${NC}" && return
-    grep -q ":${np}:" "$USERS_DB" 2>/dev/null && { echo -e "${R}  Password in use.${NC}"; return; }
+    grep -q ":${np}:" "$USERS_DB" && { echo -e "${R}  Password in use.${NC}"; return; }
     [[ "$np" == *"${HWID_SEP}"* ]] && echo -e "${R}  Password cannot contain '|'.${NC}" && return
     read -rp "  New device HWID: " nh
     nh=$(echo "$nh" | tr -d ' ')
@@ -886,17 +802,16 @@ hwid_add_device() {
     echo "${username}:${np}:${inh}:0:1:${nh}" >> "$USERS_DB"
     rebuild_config; apply_conn_limits
     systemctl restart "$SVC" 2>/dev/null
+    local zp; zp=$(zivpn_password "$np" "$nh")
     echo -e "${G}  ✓ Device added.${NC}"
-    echo -e "  Password : ${Y}${np}${NC}"
-    echo -e "  HWID     : ${M}${nh}${NC}"
-    [[ "$nh" != "unbound" ]] && echo -e "  ${W}Client enters:${NC} ${Y}${np}${M}|${nh}${NC}"
+    echo -e "  Client types in ZIVPN app: ${Y}${zp}${NC}"
 }
 
 hwid_unbind() {
     echo -e "${M}═══ Unbind HWID ═════════════════════════════════════════════${NC}"
     read -rp "  Password of entry to unbind: " tp
     tp=$(echo "$tp" | tr -d ' ')
-    grep -q ":${tp}:" "$USERS_DB" 2>/dev/null || { echo -e "${R}  Not found.${NC}"; return; }
+    grep -q ":${tp}:" "$USERS_DB" || { echo -e "${R}  Not found.${NC}"; return; }
     read -rp "  Confirm unbind? [y/N]: " c
     [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && return
     local tmp; tmp=$(mktemp)
@@ -907,11 +822,12 @@ hwid_unbind() {
             || echo "${u}:${p}:${e}:${bw}:${mc}:${hwid}" >> "$tmp"
     done < "$USERS_DB"
     mv "$tmp" "$USERS_DB"
+    rebuild_config
+    systemctl restart "$SVC" 2>/dev/null
     echo -e "${G}  HWID unbound. Entry now accepts any device.${NC}"
 }
 
 hwid_search() {
-    echo -e "${M}═══ Search by HWID ══════════════════════════════════════════${NC}"
     read -rp "  HWID to search: " sh
     sh=$(echo "$sh" | tr -d ' ')
     [[ -z "$sh" ]] && return
@@ -923,295 +839,97 @@ hwid_search() {
             found=$((found+1))
         fi
     done < "$USERS_DB"
-    [[ "$found" -eq 0 ]] && echo -e "  ${Y}No match found.${NC}" || echo -e "\n  ${found} result(s)."
+    [[ "$found" -eq 0 ]] && echo -e "  ${Y}No match found.${NC}" \
+        || echo -e "\n  ${found} result(s)."
 }
 
-hwid_show_client_string() {
+hwid_client_strings() {
     echo -e "${M}═══ Client Connection Strings ═══════════════════════════════${NC}"
-    echo -e "  ${W}Copy the exact string below into the ZIVPN app password field:${NC}"
+    echo -e "  ${W}Give these EXACT strings to each user for their ZIVPN app:${NC}"
     echo ""
     local ip; ip=$(get_ip)
-    local mode; mode=$(auth_mode)
-    if [[ "$mode" != "external" ]]; then
-        echo -e "  ${Y}⚠ HWID enforcement is currently OFF.${NC}"
-        echo -e "  ${Y}  Enable it via option 21 first.${NC}"
-        echo ""
-    fi
     while IFS=':' read -r u p e bw mc hwid; do
         [[ -z "$u" ]] && continue
         is_expired "$e" && continue
-        echo -e "  ${W}User:${NC} ${G}${u}${NC}"
-        echo -e "  ${W}UDP Server  :${NC} ${Y}${ip}${NC}"
-        if [[ "$hwid" != "unbound" ]]; then
-            echo -e "  ${W}UDP Password:${NC} ${Y}${p}${M}|${hwid}${NC}   ${G}← paste this EXACTLY${NC}"
-        else
-            echo -e "  ${W}UDP Password:${NC} ${Y}${p}${NC}   ${Y}(no HWID restriction)${NC}"
-        fi
-        is_expired "$e" || echo -e "  ${W}Expiry      :${NC} ${Y}${e}${NC}"
+        local zp; zp=$(zivpn_password "$p" "$hwid")
+        echo -e "  ${W}User: ${G}${u}${NC}"
+        echo -e "  UDP Server   → ${Y}${ip}${NC}"
+        echo -e "  UDP Password → ${Y}${zp}${NC}"
+        [[ "$hwid" != "unbound" ]] \
+            && echo -e "  HWID Locked  → ${M}Yes — wrong device = DENIED${NC}" \
+            || echo -e "  HWID Locked  → ${Y}No — any device accepted${NC}"
+        echo -e "  Expiry       → ${Y}${e}${NC}"
         divider
     done < "$USERS_DB"
 }
 
 hwid_export() {
-    echo -e "${M}═══ Export HWID List ════════════════════════════════════════${NC}"
     local f="/etc/zivpn/hwid_export_$(date +%Y%m%d_%H%M%S).txt"
     {
         echo "# OPUDP HWID Export — $(date)"
-        echo "# FORMAT: USERNAME | PASSWORD | EXPIRY | CONN | HWID | STATUS"
-        echo "# ────────────────────────────────────────────────────────────"
+        printf "%-16s | %-16s | %-34s | %-12s | %-26s | %s\n" \
+            "USERNAME" "PASSWORD" "ZIVPN_PASSWORD (type in app)" "EXPIRY" "HWID" "STATUS"
+        echo "# ────────────────────────────────────────────────────────────────────────────"
         while IFS=':' read -r u p e bw mc hwid; do
             [[ -z "$u" ]] && continue
-            [[ -z "$hwid" ]] && hwid="unbound"; [[ -z "$mc" ]] && mc=0
-            local st; is_expired "$e" && st="EXPIRED" || st="ACTIVE"
-            printf "%-16s | %-18s | %-12s | %-6s | %-26s | %s\n" \
-                "$u" "$p" "$e" "$mc" "$hwid" "$st"
+            [[ -z "$hwid" ]] && hwid="unbound"
+            local zp st
+            zp=$(zivpn_password "$p" "$hwid")
+            is_expired "$e" && st="EXPIRED" || st="ACTIVE"
+            printf "%-16s | %-16s | %-34s | %-12s | %-26s | %s\n" \
+                "$u" "$p" "$zp" "$e" "$hwid" "$st"
         done < "$USERS_DB"
     } > "$f"
     echo -e "${G}  Exported: ${Y}${f}${NC}"
+    echo ""
     cat "$f"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  21) HWID Enforcement Setup ← NEW CORE FEATURE
+#  21) Client Setup Guide
 # ══════════════════════════════════════════════════════════════
-hwid_enforcement_setup() {
-    while true; do
-        clear
-        local mode; mode=$(auth_mode)
-        local auth_st; auth_st=$(systemctl is-active "$AUTH_SVC" 2>/dev/null)
-
-        echo -e "${M}╔══════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${M}║         TRUE HWID ENFORCEMENT — Setup & Control              ║${NC}"
-        echo -e "${M}╚══════════════════════════════════════════════════════════════╝${NC}"
-        echo ""
-        echo -e "  Current auth mode  : ${Y}${mode}${NC}"
-        if [[ "$auth_st" == "active" ]]; then
-            echo -e "  Auth daemon status : ${G}running${NC}"
-        else
-            echo -e "  Auth daemon status : ${R}stopped${NC}"
-        fi
-        echo ""
-        echo -e "  ${M}────── How True HWID Enforcement Works ──────${NC}"
-        echo "  When enabled, ZIVPN uses 'external' auth mode."
-        echo "  Every connection attempt calls opudp-authd which:"
-        echo "    • Verifies the password exists in users.db"
-        echo "    • Checks the account is not expired"
-        echo "    • Splits the payload on '|' to extract the HWID"
-        echo "    • Compares client HWID against the stored HWID"
-        echo "    • DENIES if any check fails — including wrong HWID"
-        echo ""
-        echo "  Client enters in ZIVPN app:  password|HWID"
-        echo "  Example:  abc123|a1b2c3d4e5f6a1b2"
-        echo ""
-        echo -e "  ${M}─────────────────────────────────────────────${NC}"
-        echo ""
-        echo -e "  ${M}a)${NC} ${G}ENABLE${NC}  HWID enforcement (switch to external auth)"
-        echo -e "  ${M}b)${NC} ${R}DISABLE${NC} HWID enforcement (switch back to passwords)"
-        echo -e "  ${M}c)${NC} Start auth daemon"
-        echo -e "  ${M}d)${NC} Stop auth daemon"
-        echo -e "  ${M}e)${NC} Restart auth daemon"
-        echo -e "  ${M}f)${NC} View live auth log (Ctrl+C to stop)"
-        echo -e "  ${M}g)${NC} View recent deny log"
-        echo -e "  ${M}h)${NC} Test auth daemon manually"
-        echo -e "  ${M}0)${NC} Back to main menu"
-        echo ""
-        echo -ne "${M}Choose ► ${NC}"
-        read -r sc; echo ""
-        case "$sc" in
-            a) hwid_enable_enforcement ;;
-            b) hwid_disable_enforcement ;;
-            c) systemctl start  "$AUTH_SVC" 2>/dev/null && echo -e "${G}  Auth daemon started.${NC}" || echo -e "${R}  Failed. Run option h to diagnose.${NC}" ;;
-            d) systemctl stop   "$AUTH_SVC" 2>/dev/null && echo -e "${R}  Auth daemon stopped.${NC}" ;;
-            e) systemctl restart "$AUTH_SVC" 2>/dev/null && echo -e "${G}  Auth daemon restarted.${NC}" ;;
-            f) echo -e "${C}  Ctrl+C to stop${NC}"; tail -f "$AUTH_LOG" ;;
-            g) hwid_show_deny_log ;;
-            h) hwid_test_auth ;;
-            0) break ;;
-            *) echo -e "${R}  Invalid.${NC}" ;;
-        esac
-        [[ "$sc" != "0" ]] && pause
-    done
-}
-
-hwid_enable_enforcement() {
-    echo -e "${M}═══ Enable True HWID Enforcement ════════════════════════════${NC}"
+client_guide() {
+    clear
+    local ip; ip=$(get_ip)
+    echo -e "${C}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${C}║              Client Setup Guide — HWID Enforcement           ║${NC}"
+    echo -e "${C}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-
-    # Check Python3 is available
-    if ! command -v python3 &>/dev/null; then
-        echo -e "${Y}  Python3 not found. Installing...${NC}"
-        apt-get install -y python3 2>/dev/null
-        command -v python3 &>/dev/null || { echo -e "${R}  Python3 install failed. Cannot continue.${NC}"; return; }
-    fi
-    echo -e "  ${G}Python3 found.${NC}"
-
-    # Check auth binary exists
-    if [[ ! -f "$AUTH_BIN" ]]; then
-        echo -e "${R}  opudp-authd not found at ${AUTH_BIN}${NC}"
-        echo -e "  ${Y}Download and place it there, then re-run this option.${NC}"
-        return
-    fi
-    chmod +x "$AUTH_BIN"
-    echo -e "  ${G}Auth daemon binary found.${NC}"
-
-    # Install systemd service
-    install_auth_service
-    sleep 1
-
-    if ! systemctl is-active --quiet "$AUTH_SVC"; then
-        echo -e "${R}  Auth daemon failed to start!${NC}"
-        echo -e "  ${Y}Check: journalctl -u opudp-auth -n 30${NC}"
-        return
-    fi
-    echo -e "  ${G}Auth daemon is running.${NC}"
-
-    # Check unbound users — warn admin
-    local unbound_count=0
-    while IFS=':' read -r u p e bw mc hwid; do
-        [[ -z "$u" ]] && continue
-        [[ "$hwid" == "unbound" || -z "$hwid" ]] && unbound_count=$((unbound_count+1))
-    done < "$USERS_DB"
-
-    if [[ "$unbound_count" -gt 0 ]]; then
-        echo ""
-        echo -e "  ${Y}⚠ Warning: ${unbound_count} entry/entries have HWID='unbound'.${NC}"
-        echo -e "  ${Y}  These entries will accept connections from ANY device.${NC}"
-        echo -e "  ${Y}  Use option 20 → b to bind HWIDs to those entries.${NC}"
-        echo ""
-        read -rp "  Continue enabling enforcement anyway? [y/N]: " uc
-        [[ "$uc" != "y" && "$uc" != "Y" ]] && echo "  Cancelled." && return
-    fi
-
-    # Switch ZIVPN to external auth mode
-    rebuild_config_external
-    systemctl restart "$SVC" 2>/dev/null
-    sleep 1
-
-    if systemctl is-active --quiet "$SVC"; then
-        echo ""
-        echo -e "${G}  ✓ HWID Enforcement is now ACTIVE!${NC}"
-        echo ""
-        echo -e "  ${W}What changes for your users:${NC}"
-        echo -e "  • They must enter ${Y}password${M}|${Y}HWID${NC} in the ZIVPN app"
-        echo -e "  • Wrong HWID = DENIED even with correct password"
-        echo -e "  • No HWID in password field = DENIED"
-        echo -e "  • Unbound entries still accept any HWID"
-        echo ""
-        echo -e "  ${W}How to get Android HWID:${NC}"
-        echo -e "  • Settings → About Phone → Android ID"
-        echo -e "  • Termux: ${Y}settings get secure android_id${NC}"
-        echo -e "  • Dial:   ${Y}*#*#8255#*#*${NC}"
-    else
-        echo -e "${R}  ZIVPN failed to restart. Reverting to passwords mode.${NC}"
-        rebuild_config_passwords
-        systemctl restart "$SVC" 2>/dev/null
-    fi
-}
-
-hwid_disable_enforcement() {
-    echo -e "${M}═══ Disable HWID Enforcement ════════════════════════════════${NC}"
+    echo -e "  ${W}How HWID enforcement works in this version:${NC}"
     echo ""
-    echo -e "  ${Y}This switches ZIVPN back to plain password mode.${NC}"
-    echo -e "  ${Y}Any device with the correct password can connect.${NC}"
-    read -rp "  Confirm disable HWID enforcement? [y/N]: " c
-    [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && return
-    rebuild_config_passwords
-    systemctl restart "$SVC" 2>/dev/null
-    echo -e "${G}  HWID enforcement disabled. Switched to passwords mode.${NC}"
-}
-
-hwid_show_deny_log() {
-    echo -e "${M}═══ Recent DENY Events ══════════════════════════════════════${NC}"
+    echo "  The device's HWID is baked directly into the password."
+    echo "  ZIVPN sees:  password|HWID  as the full password string."
+    echo "  If someone uses the wrong device (different HWID), the"
+    echo "  combined string won't match → connection is DENIED."
     echo ""
-    if [[ ! -f "$AUTH_LOG" ]]; then
-        echo -e "  ${Y}No auth log found yet.${NC}"; return
-    fi
-    local denies
-    denies=$(grep "DENY" "$AUTH_LOG" 2>/dev/null | tail -30)
-    if [[ -z "$denies" ]]; then
-        echo -e "  ${G}No DENY events recorded yet.${NC}"
-    else
-        echo "$denies" | while read -r line; do
-            echo -e "  ${R}${line}${NC}"
-        done
-    fi
+    divider
     echo ""
-    echo -e "  Full log: ${Y}${AUTH_LOG}${NC}"
-    echo -e "  Conn log: ${Y}${CONN_LOG}${NC}"
-}
-
-hwid_test_auth() {
-    echo -e "${M}═══ Test Auth Daemon ════════════════════════════════════════${NC}"
+    echo -e "  ${W}Step 1 — Get Android ID (HWID):${NC}"
+    echo -e "    • Settings → About Phone → Android ID"
+    echo -e "    • Termux:  ${Y}settings get secure android_id${NC}"
+    echo -e "    • Dial:    ${Y}*#*#8255#*#*${NC}  (Google Talk Service Monitor)"
     echo ""
-    if ! systemctl is-active --quiet "$AUTH_SVC"; then
-        echo -e "${R}  Auth daemon is not running. Start it first (option c).${NC}"; return
-    fi
-    echo -e "  Sending test request to auth daemon on port ${AUTH_PORT}..."
+    echo -e "  ${W}Step 2 — Add user with HWID in panel:${NC}"
+    echo -e "    • Run ${Y}opudp${NC} → option ${G}6${NC}"
+    echo -e "    • Enter password (e.g. ${Y}abc123${NC})"
+    echo -e "    • Enter HWID when asked (e.g. ${M}a1b2c3d4e5f6a1b2${NC})"
     echo ""
-
-    # Test 1: no HWID separator
-    local r1
-    r1=$(curl -s -X POST "http://127.0.0.1:${AUTH_PORT}/auth" \
-        -H "Content-Type: application/json" \
-        -d '{"addr":"1.2.3.4:1234","payload":"testpassword"}' 2>/dev/null)
-    echo -ne "  Test 1 — No HWID separator:  "
-    echo "$r1" | grep -q '"ok":false' \
-        && echo -e "${G}DENIED correctly${NC} ${Y}(${r1})${NC}" \
-        || echo -e "${R}Unexpected: ${r1}${NC}"
-
-    # Test 2: random wrong password
-    local r2
-    r2=$(curl -s -X POST "http://127.0.0.1:${AUTH_PORT}/auth" \
-        -H "Content-Type: application/json" \
-        -d '{"addr":"1.2.3.4:1234","payload":"wrongpassword|randomhwid"}' 2>/dev/null)
-    echo -ne "  Test 2 — Wrong password:     "
-    echo "$r2" | grep -q '"ok":false' \
-        && echo -e "${G}DENIED correctly${NC} ${Y}(${r2})${NC}" \
-        || echo -e "${R}Unexpected: ${r2}${NC}"
-
-    # Test 3: real user (pick first bound entry)
-    local tp th tu
-    while IFS=':' read -r u p e bw mc hwid; do
-        [[ -z "$u" ]] && continue
-        if [[ "$hwid" != "unbound" && -n "$hwid" ]]; then
-            tp="$p"; th="$hwid"; tu="$u"; break
-        fi
-    done < "$USERS_DB"
-
-    if [[ -n "$tp" ]]; then
-        local r3
-        r3=$(curl -s -X POST "http://127.0.0.1:${AUTH_PORT}/auth" \
-            -H "Content-Type: application/json" \
-            -d "{\"addr\":\"1.2.3.4:1234\",\"payload\":\"${tp}|${th}\"}" 2>/dev/null)
-        echo -ne "  Test 3 — Valid pass+HWID (${tu}): "
-        echo "$r3" | grep -q '"ok":true' \
-            && echo -e "${G}ALLOWED correctly${NC} ${Y}(${r3})${NC}" \
-            || echo -e "${R}Unexpected — check users.db: ${r3}${NC}"
-
-        # Test 4: correct password, WRONG HWID
-        local r4
-        r4=$(curl -s -X POST "http://127.0.0.1:${AUTH_PORT}/auth" \
-            -H "Content-Type: application/json" \
-            -d "{\"addr\":\"1.2.3.4:1234\",\"payload\":\"${tp}|WRONGHWID0000\"}" 2>/dev/null)
-        echo -ne "  Test 4 — Correct pass, WRONG HWID: "
-        echo "$r4" | grep -q '"ok":false' \
-            && echo -e "${G}DENIED correctly${NC} ${Y}(${r4})${NC}" \
-            || echo -e "${R}NOT denied — HWID enforcement may be broken: ${r4}${NC}"
-    else
-        echo -e "  ${Y}Test 3 & 4 skipped — no HWID-bound entries found. Add one first.${NC}"
-    fi
-
+    echo -e "  ${W}Step 3 — What user types in ZIVPN app:${NC}"
+    echo -e "    UDP Server   → ${Y}${ip}${NC}"
+    echo -e "    UDP Password → ${Y}abc123${M}|${Y}a1b2c3d4e5f6a1b2${NC}"
+    echo -e "                    ${Y}↑ password${NC}  ${M}↑ | separator + HWID${NC}"
     echo ""
-    echo -e "  ${G}Tests complete.${NC} All 4 should show 'correctly'.${NC}"
-}
-
-# ══════════════════════════════════════════════════════════════
-#  22) Auth Deny Log (live)
-# ══════════════════════════════════════════════════════════════
-auth_deny_log() {
-    echo -e "${M}═══ Live Auth Log — Ctrl+C to stop ══════════════════════════${NC}"
+    echo -e "  ${W}Step 4 — Use option 20 → f to get ready-made strings per user${NC}"
     echo ""
-    [[ -f "$AUTH_LOG" ]] && tail -f "$AUTH_LOG" || echo -e "  ${Y}Auth log not found. Enable enforcement first.${NC}"
+    divider
+    echo ""
+    echo -e "  ${M}What gets DENIED:${NC}"
+    echo -e "    ${R}✗${NC} Correct password, wrong HWID   → DENIED"
+    echo -e "    ${R}✗${NC} Correct password, no HWID      → DENIED"
+    echo -e "    ${R}✗${NC} Wrong password entirely         → DENIED"
+    echo -e "    ${R}✗${NC} Expired account                 → DENIED"
+    echo -e "    ${G}✓${NC} Correct password + correct HWID → ALLOWED"
+    echo ""
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -1224,13 +942,11 @@ uninstall() {
     local iface port ps pe
     iface=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
     port=$(get_port); ps=$(echo "$port"|cut -d: -f1); pe=$(echo "$port"|cut -d: -f2)
-    systemctl stop    "$SVC"      2>/dev/null
-    systemctl disable "$SVC"      2>/dev/null
-    systemctl stop    "$AUTH_SVC" 2>/dev/null
-    systemctl disable "$AUTH_SVC" 2>/dev/null
-    rm -f /etc/systemd/system/zivpn.service "$AUTH_SVC_FILE"
+    systemctl stop    "$SVC" 2>/dev/null
+    systemctl disable "$SVC" 2>/dev/null
+    rm -f /etc/systemd/system/zivpn.service
     systemctl daemon-reload 2>/dev/null
-    rm -f "$BIN" "$AUTH_BIN"
+    rm -f "$BIN"
     iptables -t nat -D PREROUTING -i "$iface" -p udp \
         --dport "${ps}:${pe}" -j DNAT --to-destination ":${LISTEN_PORT}" 2>/dev/null
     iptables -L INPUT --line-numbers -n 2>/dev/null | \
@@ -1255,29 +971,28 @@ while true; do
     show_menu
     read -r choice; echo ""
     case $choice in
-        1)  start_svc              ;;
-        2)  stop_svc               ;;
-        3)  restart_svc            ;;
-        4)  show_status            ;;
-        5)  list_users             ;;
-        6)  add_user               ;;
-        7)  remove_user            ;;
-        8)  renew_user             ;;
-        9)  cleanup_expired        ;;
-        10) conn_stats             ;;
-        11) bw_report              ;;
-        12) reset_bandwidth        ;;
-        13) speed_test             ;;
-        14) live_logs              ;;
-        15) backup_data            ;;
-        16) restore_backup         ;;
-        17) change_port            ;;
-        18) auto_update            ;;
-        19) set_conn_limit         ;;
-        20) hwid_menu              ;;
-        21) hwid_enforcement_setup ;;
-        22) auth_deny_log          ;;
-        99) uninstall              ;;
+        1)  start_svc       ;;
+        2)  stop_svc        ;;
+        3)  restart_svc     ;;
+        4)  show_status     ;;
+        5)  list_users      ;;
+        6)  add_user        ;;
+        7)  remove_user     ;;
+        8)  renew_user      ;;
+        9)  cleanup_expired ;;
+        10) conn_stats      ;;
+        11) bw_report       ;;
+        12) reset_bandwidth ;;
+        13) speed_test      ;;
+        14) live_logs       ;;
+        15) backup_data     ;;
+        16) restore_backup  ;;
+        17) change_port     ;;
+        18) auto_update     ;;
+        19) set_conn_limit  ;;
+        20) hwid_menu       ;;
+        21) client_guide    ;;
+        99) uninstall       ;;
         0)  echo -e "  ${G}Bye!${NC}"; exit 0 ;;
         *)  echo -e "${R}  Invalid: ${choice}${NC}" ;;
     esac
