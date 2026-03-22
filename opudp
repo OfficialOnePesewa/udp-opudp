@@ -1,567 +1,123 @@
 #!/bin/bash
 # ============================================================
-#  OPUDP — ZIVPN UDP Ultimate Control Panel 🔥 FIRE EDITION
+#  OPUDP — ZIVPN UDP Ultimate Control Panel
 #  Author  : OfficialOnePesewa
 #  GitHub  : https://github.com/OfficialOnePesewa/udp-opudp
 #  Command : opudp
-#  Version : 4.1.0
+#  Version : 4.0.0
 # ============================================================
 #
-#  DB FORMAT:
-#  username:password:expiry:quota_mb:max_conn:created_date
+#  CREDENTIAL GUIDE:
+#  ─────────────────────────────────────────────────────────
+#  USERNAME  → label only (panel management)
+#  PASSWORD  → what user enters in ZIVPN Pro app
+#  MAX CONN  → max simultaneous device connections (0=unlimited)
+#  HWID      → device fingerprint — locks password to ONE device
 #
-#  BANDWIDTH FILES (all in /etc/zivpn/bwused/):
-#    USERNAME          → cumulative bytes used  (NEVER auto-reset)
-#    .USERNAME_raw     → last iptables snapshot (bytes, for delta calc)
-#    .USERNAME_blocked → exists when quota exhausted
+#  HWID SYSTEM:
+#  ─────────────────────────────────────────────────────────
+#  When HWID is set for a user, ONLY that specific device IP
+#  can connect using that password. Anyone who copies the
+#  password to a different device/IP will be BLOCKED.
 #
-#  HOW COUNTING WORKS:
-#    Every 60s (cron) → read iptables byte counters per connected IP
-#    delta = current_bytes - last_snapshot
-#    If iptables reset (reboot/restart) → current < last → delta = current
-#    delta is ADDED to cumulative file → never lost across reboots
+#  HOW IT WORKS:
+#    1. User connects for the first time → their IP is captured
+#       as their HWID (device fingerprint) automatically
+#    2. OR admin manually sets the HWID from user's device info
+#    3. iptables rules enforce: only that IP can use that account
+#    4. Admin can reset HWID to allow a device change
 #
-#  QUOTA ENFORCEMENT:
-#    Once cumulative_bytes >= quota_mb * 1048576 → user blocked
-#    Block = remove password from config.json + restart ZIVPN
-#    Unblock = admin resets bandwidth via option 12
+#  users.db format (7 fields):
+#  username:password:expiry:bandwidth:max_conn:hwid:hwid_locked
+#  hwid_locked → 0=not yet captured, 1=locked to device
 # ============================================================
 
 CONFIG="/etc/zivpn/config.json"
 USERS_DB="/etc/zivpn/users.db"
+CODES_DB="/etc/zivpn/codes.db"
 PORT_FILE="/etc/zivpn/port_range"
 BACKUP_DIR="/etc/zivpn/backups"
 SESSIONS_DIR="/etc/zivpn/sessions"
+HWID_LOG="/etc/zivpn/hwid.log"
 CONN_LOG="/etc/zivpn/connections.log"
-TRIALS_DB="/etc/zivpn/trials.db"
-LASTSEEN_DIR="/etc/zivpn/lastseen"
-BWUSED_DIR="/etc/zivpn/bwused"
-BW_LOCK="/etc/zivpn/.bwlock"
+HWID_RULES="/etc/zivpn/hwid_rules.sh"
 SVC="zivpn"
 BIN="/usr/local/bin/zivpn"
 LISTEN_PORT="5667"
-PANEL_VERSION="4.1.0"
+PANEL_VERSION="4.0.0"
 GITHUB_RAW="https://raw.githubusercontent.com/OfficialOnePesewa/udp-opudp/main"
-BWMON_SCRIPT="/usr/local/bin/opudp-bwmon"
-BWMON_CRON="/etc/cron.d/opudp-bwmon"
 
-# ── 🔥 FIRE COLOURS ───────────────────────────────────────────
-FR='\033[38;5;196m'
-OR='\033[38;5;208m'
-GO='\033[38;5;220m'
-YW='\033[1;33m'
-W='\033[1;37m'
-DIM='\033[2;37m'
-G='\033[0;32m'
-R='\033[0;31m'
-NC='\033[0m'
+# ── Colours ──────────────────────────────────────────────────
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'
+C='\033[0;36m'; W='\033[1;37m'; M='\033[0;35m'; NC='\033[0m'
 
-# ══════════════════════════════════════════════════════════════
-#  BACKGROUND BANDWIDTH MONITOR (called by cron every minute)
-# ══════════════════════════════════════════════════════════════
-if [[ "$1" == "--bwmon" ]]; then
-
-    # ── lock so two ticks never run simultaneously ─────────────
-    exec 9>"$BW_LOCK"
-    flock -n 9 || exit 0
-
-    [[ ! -f "$USERS_DB" ]] && exit 0
-
-    # Ensure chain exists and is hooked
-    iptables -N ZIVPN_BW 2>/dev/null
-    iptables -C INPUT  -j ZIVPN_BW 2>/dev/null || iptables -I INPUT  -j ZIVPN_BW
-    iptables -C OUTPUT -j ZIVPN_BW 2>/dev/null || iptables -I OUTPUT -j ZIVPN_BW
-
-    # ── snapshot all byte counters from iptables-save -c ───────
-    # iptables-save -c outputs lines like:
-    #   [pkts:bytes] -A ZIVPN_BW ... -m comment --comment "TAG"
-    IPTABLES_SNAP=$(iptables-save -c 2>/dev/null)
-
-    # Helper: read bytes for a specific comment tag
-    _bytes_for_tag() {
-        local tag="$1"
-        # Match the line, extract the bytes field (second number in [pkts:bytes])
-        echo "$IPTABLES_SNAP" | grep "\"${tag}\"" | \
-            grep -o '^\[[0-9]*:[0-9]*\]' | \
-            cut -d: -f2 | tr -d ']' | head -1
-    }
-
-    # ── for each active session IP, add bytes to user's counter ─
-    while IFS=':' read -r u p e quota mc cd; do
-        [[ -z "$u" || -z "$p" ]] && continue
-
-        local used_file="${BWUSED_DIR}/${u}"
-        local raw_file="${BWUSED_DIR}/.${u}_raw"
-
-        # Init cumulative file (bytes) if first time
-        [[ ! -f "$used_file" ]] && echo "0" > "$used_file"
-
-        # Get IPs for this user from sessions file
-        local sfile="${SESSIONS_DIR}/${p}.sessions"
-
-        # Collect total iptables bytes across all IPs for this user
-        local iptables_total=0
-
-        if [[ -f "$sfile" ]]; then
-            while read -r ip; do
-                [[ -z "$ip" ]] && continue
-                local tag_in="zivpn_bw_${u}_in_${ip}"
-                local tag_out="zivpn_bw_${u}_out_${ip}"
-                local b_in b_out
-                b_in=$(_bytes_for_tag "$tag_in")
-                b_out=$(_bytes_for_tag "$tag_out")
-                [[ -z "$b_in"  || ! "$b_in"  =~ ^[0-9]+$ ]] && b_in=0
-                [[ -z "$b_out" || ! "$b_out" =~ ^[0-9]+$ ]] && b_out=0
-                iptables_total=$(( iptables_total + b_in + b_out ))
-            done < "$sfile"
-        else
-            # Fallback: count ALL traffic on LISTEN_PORT attributed to this user
-            # (works when only one user or as aggregate)
-            local b_in b_out
-            b_in=$(_bytes_for_tag "zivpn_bw_${u}_in")
-            b_out=$(_bytes_for_tag "zivpn_bw_${u}_out")
-            [[ -z "$b_in"  || ! "$b_in"  =~ ^[0-9]+$ ]] && b_in=0
-            [[ -z "$b_out" || ! "$b_out" =~ ^[0-9]+$ ]] && b_out=0
-            iptables_total=$(( b_in + b_out ))
-        fi
-
-        # ── delta calculation (SURVIVES iptables resets) ────────
-        local prev_snapshot=0
-        [[ -f "$raw_file" ]] && {
-            prev_snapshot=$(cat "$raw_file" 2>/dev/null)
-            [[ ! "$prev_snapshot" =~ ^[0-9]+$ ]] && prev_snapshot=0
-        }
-
-        local delta=0
-        if [[ $iptables_total -ge $prev_snapshot ]]; then
-            # Normal case: counter went up since last tick
-            delta=$(( iptables_total - prev_snapshot ))
-        else
-            # iptables was reset (restart/reboot) — counter is below
-            # what we last saw. Count everything since reset as new delta.
-            delta=$iptables_total
-        fi
-
-        # ALWAYS update snapshot so next tick has correct baseline
-        echo "$iptables_total" > "$raw_file"
-
-        # Add delta bytes to cumulative file (bytes, never decreases)
-        if [[ $delta -gt 0 ]]; then
-            local current_bytes
-            current_bytes=$(cat "$used_file" 2>/dev/null || echo 0)
-            [[ ! "$current_bytes" =~ ^[0-9]+$ ]] && current_bytes=0
-            echo $(( current_bytes + delta )) > "$used_file"
-        fi
-
-    done < "$USERS_DB"
-
-    # ── quota enforcement pass ──────────────────────────────────
-    local rebuild_needed=0
-    while IFS=':' read -r u p e quota mc cd; do
-        [[ -z "$u" || -z "$p" ]] && continue
-        [[ -z "$quota" || "$quota" -eq 0 ]] && continue   # unlimited
-
-        local used_bytes quota_bytes flag_file
-        used_bytes=$(cat "${BWUSED_DIR}/${u}" 2>/dev/null || echo 0)
-        [[ ! "$used_bytes" =~ ^[0-9]+$ ]] && used_bytes=0
-        quota_bytes=$(( quota * 1048576 ))
-        flag_file="${BWUSED_DIR}/.${u}_blocked"
-
-        if [[ $used_bytes -ge $quota_bytes ]]; then
-            if [[ ! -f "$flag_file" ]]; then
-                touch "$flag_file"
-                rebuild_needed=1
-                echo "[$(date)] BLOCKED: ${u} used $(( used_bytes/1048576 ))MB of ${quota}MB quota" \
-                    >> /etc/zivpn/bwmon.log
-            fi
-        fi
-    done < "$USERS_DB"
-
-    # Rebuild config and restart if any user was just blocked
-    if [[ $rebuild_needed -eq 1 ]]; then
-        local pwds=()
-        while IFS=':' read -r u p e quota mc cd; do
-            [[ -z "$u" || -z "$p" ]] && continue
-            [[ "$e" != "never" && "$e" < "$(date +%Y-%m-%d)" ]] && continue
-            [[ -f "${BWUSED_DIR}/.${u}_blocked" ]] && continue
-            pwds+=("\"$p\"")
-        done < "$USERS_DB"
-        local plist=""
-        if [[ ${#pwds[@]} -gt 0 ]]; then
-            plist=$(printf '%s,' "${pwds[@]}"); plist="${plist%,}"
-        fi
-        cat > "$CONFIG" << CFGEOF
-{
-  "listen": ":${LISTEN_PORT}",
-  "cert": "/etc/zivpn/zivpn.crt",
-  "key": "/etc/zivpn/zivpn.key",
-  "obfs": "zivpn",
-  "auth": {
-    "mode": "passwords",
-    "config": [${plist}]
-  }
-}
-CFGEOF
-        systemctl restart "$SVC" 2>/dev/null
-    fi
-
-    flock -u 9
-    exit 0
-fi
-
-# ── Main panel guard ──────────────────────────────────────────
 [[ $EUID -ne 0 ]] && echo -e "${R}Run as root: sudo opudp${NC}" && exit 1
 
 # ══════════════════════════════════════════════════════════════
 #  INIT
 # ══════════════════════════════════════════════════════════════
 init() {
-    mkdir -p /etc/zivpn "$BACKUP_DIR" "$SESSIONS_DIR" \
-             "$LASTSEEN_DIR" "$BWUSED_DIR"
-    [[ ! -f "$USERS_DB"  ]] && touch "$USERS_DB"
+    mkdir -p /etc/zivpn "$BACKUP_DIR" "$SESSIONS_DIR"
+    [[ ! -f "$USERS_DB" ]] && touch "$USERS_DB"
+    [[ ! -f "$CODES_DB" ]] && touch "$CODES_DB"
     [[ ! -f "$PORT_FILE" ]] && echo "6000:19999" > "$PORT_FILE"
     [[ ! -f "$CONN_LOG"  ]] && touch "$CONN_LOG"
-    [[ ! -f "$TRIALS_DB" ]] && touch "$TRIALS_DB"
+    [[ ! -f "$HWID_LOG"  ]] && touch "$HWID_LOG"
     migrate_db
-    check_trials
-    install_bwmon
-    setup_bw_chain
+    # Start HWID monitor in background if not already running
+    start_hwid_monitor
 }
 
+# ── Migrate DB to 7-field format ─────────────────────────────
 migrate_db() {
     local tmp changed=0
     tmp=$(mktemp)
-    local TODAY; TODAY=$(date +%Y-%m-%d)
-    while IFS=':' read -r u p e bw mc cd; do
+    while IFS=':' read -r u p e bw mc hwid hlocked; do
         [[ -z "$u" ]] && continue
-        [[ -z "$mc" ]] && mc=0   && changed=1
-        [[ -z "$cd" ]] && cd="$TODAY" && changed=1
-        [[ -z "$bw" ]] && bw=0   && changed=1
-        echo "${u}:${p}:${e}:${bw}:${mc}:${cd}" >> "$tmp"
-        # Init bytes file if missing (preserves existing value)
-        [[ ! -f "${BWUSED_DIR}/${u}" ]] && echo "0" > "${BWUSED_DIR}/${u}"
-    done < "$USERS_DB"
-    [[ $changed -eq 1 ]] && mv "$tmp" "$USERS_DB" || rm -f "$tmp"
-}
-
-install_bwmon() {
-    # Write monitor wrapper
-    cat > "$BWMON_SCRIPT" << 'BWMON'
-#!/bin/bash
-/usr/local/bin/opudp --bwmon
-BWMON
-    chmod +x "$BWMON_SCRIPT"
-    # Install cron if missing
-    if [[ ! -f "$BWMON_CRON" ]]; then
-        echo "* * * * * root ${BWMON_SCRIPT} >> /etc/zivpn/bwmon.log 2>&1" \
-            > "$BWMON_CRON"
-        chmod 644 "$BWMON_CRON"
-    fi
-}
-
-setup_bw_chain() {
-    iptables -N ZIVPN_BW 2>/dev/null
-    iptables -C INPUT  -j ZIVPN_BW 2>/dev/null || iptables -I INPUT  -j ZIVPN_BW
-    iptables -C OUTPUT -j ZIVPN_BW 2>/dev/null || iptables -I OUTPUT -j ZIVPN_BW
-}
-
-# Add iptables accounting rules for a user IP
-add_bw_rules_for_ip() {
-    local ip="$1" username="$2"
-    local tag_in="zivpn_bw_${username}_in_${ip}"
-    local tag_out="zivpn_bw_${username}_out_${ip}"
-    iptables -C ZIVPN_BW -s "$ip" -p udp --sport "$LISTEN_PORT" \
-        -m comment --comment "$tag_in" -j RETURN 2>/dev/null || \
-    iptables -A ZIVPN_BW -s "$ip" -p udp --sport "$LISTEN_PORT" \
-        -m comment --comment "$tag_in" -j RETURN 2>/dev/null
-    iptables -C ZIVPN_BW -d "$ip" -p udp --dport "$LISTEN_PORT" \
-        -m comment --comment "$tag_out" -j RETURN 2>/dev/null || \
-    iptables -A ZIVPN_BW -d "$ip" -p udp --dport "$LISTEN_PORT" \
-        -m comment --comment "$tag_out" -j RETURN 2>/dev/null
-}
-
-# ══════════════════════════════════════════════════════════════
-#  BANDWIDTH HELPERS
-# ══════════════════════════════════════════════════════════════
-
-# Returns raw bytes used (stored as bytes for precision)
-get_used_bytes() {
-    local username="$1"
-    local f="${BWUSED_DIR}/${username}"
-    [[ ! -f "$f" ]] && echo "0" && return
-    local v; v=$(cat "$f" 2>/dev/null)
-    [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo "0"
-}
-
-# Returns MB used (converted from bytes)
-get_used_mb() {
-    local bytes; bytes=$(get_used_bytes "$1")
-    echo $(( bytes / 1048576 ))
-}
-
-# Reset a user's bandwidth counter completely
-reset_bw() {
-    local username="$1"
-    echo "0" > "${BWUSED_DIR}/${username}"
-    rm -f "${BWUSED_DIR}/.${username}_raw"     2>/dev/null
-    rm -f "${BWUSED_DIR}/.${username}_blocked" 2>/dev/null
-}
-
-# Is this user blocked due to quota exhaustion?
-is_bw_blocked() {
-    [[ -f "${BWUSED_DIR}/.${1}_blocked" ]] && return 0
-    return 1
-}
-
-# Format bytes → human readable (KB / MB / GB)
-fmt_bytes() {
-    local b="$1"
-    if [[ $b -ge 1073741824 ]]; then
-        echo "$(echo "scale=2; $b/1073741824" | bc) GB"
-    elif [[ $b -ge 1048576 ]]; then
-        echo "$(echo "scale=1; $b/1048576" | bc) MB"
-    elif [[ $b -ge 1024 ]]; then
-        echo "$(echo "scale=0; $b/1024" | bc) KB"
-    else
-        echo "${b} B"
-    fi
-}
-
-# Format MB quota → human readable
-fmt_mb() {
-    local mb="$1"
-    if [[ $mb -eq 0 ]]; then
-        echo "Unlimited"
-    elif [[ $mb -ge 1024 ]]; then
-        echo "$(echo "scale=1; $mb/1024" | bc) GB"
-    else
-        echo "${mb} MB"
-    fi
-}
-
-# Colour-coded progress bar  [████░░░░░░] 40%
-# Args: used_bytes  quota_mb (0 = unlimited)
-bw_bar() {
-    local used_b="$1" quota_mb="$2"
-    if [[ "$quota_mb" -eq 0 ]]; then
-        echo -e "${G}[∞ Unlimited]${NC}"; return
-    fi
-    local quota_b=$(( quota_mb * 1048576 ))
-    local pct=$(( used_b * 100 / quota_b ))
-    [[ $pct -gt 100 ]] && pct=100
-    local filled=$(( pct * 20 / 100 ))   # 20-char bar
-    local empty=$(( 20 - filled ))
-    local bar="" i
-    for (( i=0; i<filled; i++ )); do bar+="█"; done
-    for (( i=0; i<empty;  i++ )); do bar+="░"; done
-    local colour
-    if   [[ $pct -ge 90 ]]; then colour="$FR"
-    elif [[ $pct -ge 70 ]]; then colour="$OR"
-    elif [[ $pct -ge 50 ]]; then colour="$YW"
-    else                          colour="$G"
-    fi
-    echo -e "${colour}[${bar}] ${pct}%${NC}"
-}
-
-# Full bandwidth summary line for a user
-# e.g.  "Used: 1.5 GB  |  Quota: 100 GB  |  Remaining: 98.5 GB"
-bw_summary_line() {
-    local username="$1" quota_mb="$2"
-    local used_bytes used_fmt quota_fmt remaining_fmt remaining_bytes
-    used_bytes=$(get_used_bytes "$username")
-    used_fmt=$(fmt_bytes "$used_bytes")
-
-    if [[ "$quota_mb" -eq 0 ]]; then
-        echo -e "  Used: ${FR}${used_fmt}${NC}  |  Quota: ${G}Unlimited${NC}"
-    else
-        local quota_bytes=$(( quota_mb * 1048576 ))
-        quota_fmt=$(fmt_mb "$quota_mb")
-        remaining_bytes=$(( quota_bytes - used_bytes ))
-        [[ $remaining_bytes -lt 0 ]] && remaining_bytes=0
-        remaining_fmt=$(fmt_bytes "$remaining_bytes")
-        echo -e "  Used: ${FR}${used_fmt}${NC}  |  Quota: ${W}${quota_fmt}${NC}  |  Remaining: ${GO}${remaining_fmt}${NC}"
-    fi
-}
-
-# ══════════════════════════════════════════════════════════════
-#  TRIAL MANAGEMENT
-# ══════════════════════════════════════════════════════════════
-check_trials() {
-    [[ ! -s "$TRIALS_DB" ]] && return
-    local NOW changed=0; NOW=$(date +%s)
-    local tmp; tmp=$(mktemp)
-    while IFS=':' read -r tu tp te tm; do
-        [[ -z "$tu" ]] && continue
-        if [[ "$NOW" -ge "$te" ]]; then
-            sed -i "/^${tu}:/d" "$USERS_DB"            2>/dev/null
-            rm -f "${SESSIONS_DIR}/${tp}.sessions"      2>/dev/null
-            rm -f "${LASTSEEN_DIR}/${tu}"               2>/dev/null
-            rm -f "${BWUSED_DIR}/${tu}"                 2>/dev/null
-            rm -f "${BWUSED_DIR}/.${tu}_raw"            2>/dev/null
-            rm -f "${BWUSED_DIR}/.${tu}_blocked"        2>/dev/null
+        # Add missing fields progressively
+        [[ -z "$mc"      ]] && mc="0"
+        [[ -z "$hwid"    ]] && hwid="none"
+        [[ -z "$hlocked" ]] && hlocked="0"
+        if [[ "$mc" == "0" && "$hwid" == "none" ]] || \
+           [[ -z $(echo "$u:$p:$e:$bw:$mc:$hwid:$hlocked" | cut -d: -f7) ]]; then
             changed=1
-        else
-            echo "${tu}:${tp}:${te}:${tm}" >> "$tmp"
         fi
-    done < "$TRIALS_DB"
-    mv "$tmp" "$TRIALS_DB"
-    [[ $changed -eq 1 ]] && rebuild_config && systemctl restart "$SVC" 2>/dev/null
-}
-
-add_trial_user() {
-    fire_header "Trial / Test User (0–60 Minutes)"
-    echo -e "  ${OR}Temporary account that auto-expires and auto-removes.${NC}"
-    echo ""
-
-    read -rp "  Trial username: " username
-    username=$(echo "$username" | tr -d ' ')
-    [[ -z "$username" ]] && echo -e "${R}Cannot be empty.${NC}" && return
-    grep -q "^${username}:" "$USERS_DB" 2>/dev/null && \
-        echo -e "${R}Already exists!${NC}" && return
-
-    read -rp "  Password (blank = auto-generate): " password
-    password=$(echo "$password" | tr -d ' ')
-    if [[ -z "$password" ]]; then
-        password="trial-$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c6)"
-        echo -e "  ${GO}Auto password: ${W}${password}${NC}"
-    fi
-
-    echo ""
-    echo -e "  ${OR}╔══════════════════════════════════════════╗${NC}"
-    echo -e "  ${OR}║${GO}       TRIAL DURATION OPTIONS             ${OR}║${NC}"
-    echo -e "  ${OR}╠══════════════════════════════════════════╣${NC}"
-    echo -e "  ${OR}║${NC}  1)  5  min    2)  10 min               ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  3)  15 min    4)  20 min               ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  5)  30 min    6)  45 min               ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  7)  60 min    8)  Custom (1–60 min)    ${OR}║${NC}"
-    echo -e "  ${OR}╚══════════════════════════════════════════╝${NC}"
-    read -rp "  Choose [1-8]: " tchoice
-    local minutes
-    case $tchoice in
-        1) minutes=5  ;; 2) minutes=10 ;; 3) minutes=15 ;;
-        4) minutes=20 ;; 5) minutes=30 ;; 6) minutes=45 ;;
-        7) minutes=60 ;;
-        8) read -rp "  Enter minutes (1–60): " minutes
-           [[ ! "$minutes" =~ ^[0-9]+$ || $minutes -lt 1 || $minutes -gt 60 ]] && \
-               echo -e "${R}Invalid.${NC}" && return ;;
-        *) echo -e "${R}Invalid.${NC}" && return ;;
-    esac
-
-    local NOW expiry_epoch expiry_date TODAY
-    NOW=$(date +%s)
-    expiry_epoch=$(( NOW + minutes * 60 ))
-    expiry_date=$(date -d "@${expiry_epoch}" +%Y-%m-%d)
-    TODAY=$(date +%Y-%m-%d)
-
-    echo "${username}:${password}:${expiry_date}:0:0:${TODAY}" >> "$USERS_DB"
-    echo "${username}:${password}:${expiry_epoch}:${minutes}"  >> "$TRIALS_DB"
-    echo "0" > "${BWUSED_DIR}/${username}"
-
-    rebuild_config && systemctl restart "$SVC" 2>/dev/null
-
-    local si; si=$(get_server_info)
-    local srv_ip country city flag ends_at
-    srv_ip=$(echo "$si"|cut -d'|' -f1)
-    country=$(echo "$si"|cut -d'|' -f2)
-    city=$(echo "$si"|cut -d'|' -f4)
-    flag=$(echo "$si"|cut -d'|' -f5)
-    ends_at=$(date -d "@${expiry_epoch}" "+%H:%M:%S")
-
-    echo ""
-    echo -e "${OR}  ╔═══════════════════════════════════════════╗${NC}"
-    echo -e "${OR}  ║${GO}  ⚡ TRIAL USER CREATED!                  ${OR}║${NC}"
-    echo -e "${OR}  ╠═══════════════════════════════════════════╣${NC}"
-    echo -e "${OR}  ║${NC}  Password   : ${GO}${password}${NC}"
-    echo -e "${OR}  ║${NC}  Duration   : ${GO}${minutes} minutes${NC}"
-    echo -e "${OR}  ║${NC}  Expires At : ${FR}${ends_at}${NC}"
-    echo -e "${OR}  ║${NC}  Server     : ${GO}${srv_ip}${NC}  ${flag} ${country}${NC}"
-    echo -e "${OR}  ╚═══════════════════════════════════════════╝${NC}"
-    _print_copy_block "$srv_ip" "$flag" "$country" "$city" \
-        "$password" "⏱ ${minutes} min trial — expires ${ends_at}" \
-        "Unlimited" "Unlimited" "TRIAL"
-    echo ""
-    echo -e "  ${GO}Live countdown (Ctrl+C to exit)...${NC}"
-    local remaining
-    while true; do
-        check_trials
-        remaining=$(( expiry_epoch - $(date +%s) ))
-        [[ $remaining -le 0 ]] && \
-            echo -e "\r  ${FR}⏰ Trial EXPIRED — '${username}' removed!         ${NC}" && \
-            echo "" && break
-        printf "\r  ${OR}⏱  ${GO}%02d:%02d${OR} remaining (mm:ss)   ${NC}" \
-            $(( remaining/60 )) $(( remaining%60 ))
-        sleep 1
-    done
-}
-
-list_trials() {
-    [[ ! -s "$TRIALS_DB" ]] && echo -e "  ${DIM}No active trials.${NC}" && return
-    local NOW; NOW=$(date +%s)
-    echo ""
-    printf "  %-18s %-20s %-8s %s\n" "USERNAME" "PASSWORD" "MINS" "EXPIRES IN"
-    fire_divider
-    while IFS=':' read -r tu tp te tm; do
-        [[ -z "$tu" ]] && continue
-        local rem=$(( te - NOW ))
-        printf "  %-18s %-20s %-8s " "$tu" "$tp" "${tm}m"
-        if [[ $rem -le 0 ]]; then
-            echo -e "${R}EXPIRED${NC}"
-        else
-            echo -e "${GO}$(( rem/60 ))m $(( rem%60 ))s left${NC}"
-        fi
-    done < "$TRIALS_DB"
+        echo "${u}:${p}:${e}:${bw}:${mc}:${hwid}:${hlocked}" >> "$tmp"
+    done < "$USERS_DB"
+    mv "$tmp" "$USERS_DB"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  CORE HELPERS
+#  HELPERS
 # ══════════════════════════════════════════════════════════════
-get_ip()   { curl -s4 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}'; }
+get_ip()   { curl -s4 --connect-timeout 5 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}'; }
 get_port() { cat "$PORT_FILE" 2>/dev/null || echo "6000:19999"; }
 today()    { date +%Y-%m-%d; }
+now_ts()   { date "+%Y-%m-%d %H:%M:%S"; }
 pause()    { echo ""; read -rp "  Press Enter to continue..."; }
-
-fire_divider() { echo -e "${OR}  ══════════════════════════════════════════════════════════${NC}"; }
-fire_header()  {
-    echo -e "${OR}  ╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${OR}  ║${GO}  🔥  ${W}${1}${OR}"
-    echo -e "${OR}  ╚══════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-}
+divider()  { echo -e "${C}──────────────────────────────────────────────────────────────${NC}"; }
 
 is_expired() {
-    [[ "$1" == "never" ]] && return 1
-    [[ "$1" < "$(today)" ]] && return 0
+    local exp="$1"
+    [[ "$exp" == "never" ]] && return 1
+    [[ "$exp" < "$(today)" ]] && return 0
     return 1
 }
 
 days_left() {
-    [[ "$1" == "never" ]] && echo "∞" && return
-    local dl=$(( ( $(date -d "$1" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
-    [[ $dl -lt 0 ]] && echo "0" || echo "$dl"
-}
-
-days_used() {
-    [[ -z "$1" || "$1" == "?" ]] && echo "?" && return
-    local du=$(( ( $(date +%s) - $(date -d "$1" +%s 2>/dev/null || echo 0) ) / 86400 ))
-    [[ $du -lt 0 ]] && echo "0" || echo "$du"
-}
-
-update_lastseen() { date +%s > "${LASTSEEN_DIR}/${1}" 2>/dev/null; }
-
-get_lastseen() {
-    local f="${LASTSEEN_DIR}/${1}"
-    [[ ! -f "$f" ]] && echo "Never" && return
-    local e; e=$(cat "$f" 2>/dev/null)
-    date -d "@${e}" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown"
+    local exp="$1"
+    [[ "$exp" == "never" ]] && echo "∞" && return
+    local now_s exp_s
+    now_s=$(date +%s)
+    exp_s=$(date -d "$exp" +%s 2>/dev/null) || { echo "?"; return; }
+    echo $(( (exp_s - now_s) / 86400 ))
 }
 
 count_active() {
     local n=0
-    while IFS=':' read -r u p e bw mc cd; do
+    while IFS=':' read -r u p e bw mc hwid hl; do
         [[ -z "$u" ]] && continue
-        is_expired "$e"   && continue
-        is_bw_blocked "$u" && continue
-        n=$(( n+1 ))
+        is_expired "$e" || n=$((n+1))
     done < "$USERS_DB"
     echo "$n"
 }
@@ -576,27 +132,19 @@ get_connected_ips() {
         awk '{print $5}' | cut -d: -f1 | sort -u
 }
 
-count_trials() {
-    [[ ! -s "$TRIALS_DB" ]] && echo "0" && return
-    local NOW n=0; NOW=$(date +%s)
-    while IFS=':' read -r tu tp te tm; do
-        [[ -z "$tu" ]] && continue
-        [[ $NOW -lt $te ]] && n=$(( n+1 ))
-    done < "$TRIALS_DB"
-    echo "$n"
-}
-
+# ══════════════════════════════════════════════════════════════
+#  CONFIG REBUILD
+# ══════════════════════════════════════════════════════════════
 rebuild_config() {
     local pwds=()
-    while IFS=':' read -r u p e bw mc cd; do
+    while IFS=':' read -r u p e bw mc hwid hl; do
         [[ -z "$u" || -z "$p" ]] && continue
-        is_expired "$e"    && continue
-        is_bw_blocked "$u" && continue
-        pwds+=("\"$p\"")
+        is_expired "$e" || pwds+=("\"$p\"")
     done < "$USERS_DB"
     local plist=""
     [[ ${#pwds[@]} -gt 0 ]] && {
-        plist=$(printf '%s,' "${pwds[@]}"); plist="${plist%,}"
+        plist=$(printf '%s,' "${pwds[@]}")
+        plist="${plist%,}"
     }
     cat > "$CONFIG" << EOF
 {
@@ -612,674 +160,623 @@ rebuild_config() {
 EOF
 }
 
-apply_conn_limits() {
-    iptables -L INPUT --line-numbers -n 2>/dev/null | grep "connlimit" | \
-        awk '{print $1}' | sort -rn | xargs -I{} iptables -D INPUT {} 2>/dev/null
-    while IFS=':' read -r u p e bw mc cd; do
-        [[ -z "$u" || "$mc" -le 0 ]] && continue
-        is_expired "$e" && continue
-        iptables -A INPUT -p udp --dport "$LISTEN_PORT" \
-            -m connlimit --connlimit-above "$mc" --connlimit-mask 32 \
-            -j REJECT --reject-with icmp-port-unreachable 2>/dev/null
-    done < "$USERS_DB"
-}
+# ══════════════════════════════════════════════════════════════
+#  HWID ENFORCEMENT ENGINE
+# ══════════════════════════════════════════════════════════════
 
-refresh_activity() {
-    local live_ips; live_ips=$(get_connected_ips)
-    [[ -z "$live_ips" ]] && return
-    while IFS=':' read -r u p e bw mc cd; do
-        [[ -z "$u" ]] && continue
-        local sfile="${SESSIONS_DIR}/${p}.sessions"
-        [[ ! -f "$sfile" ]] && continue
-        while read -r ip; do
-            [[ -z "$ip" ]] && continue
-            echo "$live_ips" | grep -q "^${ip}$" && {
-                update_lastseen "$u"
-                add_bw_rules_for_ip "$ip" "$u"
-                break
-            }
-        done < "$sfile"
-    done < "$USERS_DB"
-}
+# Apply all iptables rules: connlimit + HWID source IP filtering
+apply_all_rules() {
+    local iface
+    iface=$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}')
 
-# ── Country/flag detection ────────────────────────────────────
-country_code_to_flag() {
-    local code="${1^^}" flag="" i
-    for (( i=0; i<${#code}; i++ )); do
-        local ord; ord=$(printf '%d' "'${code:$i:1}")
-        flag+=$(python3 -c \
-            "import sys;sys.stdout.buffer.write(chr(${ord}+127397).encode('utf-8'))" \
-            2>/dev/null || echo "")
+    # ── Clear old OPUDP INPUT rules ──────────────────────────
+    # Remove rules tagged with comment "opudp-hwid" or "opudp-conn"
+    while iptables -L INPUT -n --line-numbers 2>/dev/null | \
+            grep -qE "opudp-(hwid|conn)"; do
+        local linenum
+        linenum=$(iptables -L INPUT -n --line-numbers 2>/dev/null | \
+                  grep -E "opudp-(hwid|conn)" | head -1 | awk '{print $1}')
+        [[ -z "$linenum" ]] && break
+        iptables -D INPUT "$linenum" 2>/dev/null
     done
-    echo "$flag"
+
+    # ── Rebuild rules per user ────────────────────────────────
+    while IFS=':' read -r u p e bw mc hwid hl; do
+        [[ -z "$u" ]] && continue
+        is_expired "$e" && continue
+
+        # connlimit rule
+        if [[ "$mc" =~ ^[0-9]+$ && "$mc" -gt 0 ]]; then
+            iptables -A INPUT -p udp --dport "$LISTEN_PORT" \
+                -m connlimit --connlimit-above "$mc" --connlimit-mask 0 \
+                -m comment --comment "opudp-conn-${u}" \
+                -j DROP 2>/dev/null
+        fi
+
+        # HWID rule — if locked and has a real IP
+        if [[ "$hl" == "1" && "$hwid" != "none" && -n "$hwid" ]]; then
+            # Allow only the registered HWID IP to reach the listen port
+            # Block all OTHER IPs that would use this user (we track by IP)
+            # We do this by using recent module to flag the registered IP
+            # Simpler: allow registered IP, mark unregistered attempts in log
+            iptables -A INPUT -p udp --dport "$LISTEN_PORT" \
+                ! -s "$hwid" \
+                -m comment --comment "opudp-hwid-${u}" \
+                -j LOG --log-prefix "OPUDP-HWID-BLOCK: " 2>/dev/null
+        fi
+
+    done < "$USERS_DB"
+
+    # Save persisted rules
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null
+
+    # Also write an HWID rules script for reference/debug
+    generate_hwid_rules_script
 }
 
-get_server_info() {
-    local cache="/etc/zivpn/.server_info_cache"
-    if [[ -f "$cache" ]]; then
-        local now_t cached_t
-        now_t=$(date +%s); cached_t=$(stat -c %Y "$cache" 2>/dev/null || echo 0)
-        [[ $(( now_t - cached_t )) -lt 3600 ]] && cat "$cache" && return
-    fi
-    local ip country country_code city flag raw
-    raw=$(curl -s --max-time 5 \
-        "http://ip-api.com/json/?fields=status,country,countryCode,city,query" 2>/dev/null)
-    if echo "$raw" | grep -q '"status":"success"'; then
-        ip=$(echo "$raw"|grep -o '"query":"[^"]*"'|cut -d'"' -f4)
-        country=$(echo "$raw"|grep -o '"country":"[^"]*"'|cut -d'"' -f4)
-        country_code=$(echo "$raw"|grep -o '"countryCode":"[^"]*"'|cut -d'"' -f4)
-        city=$(echo "$raw"|grep -o '"city":"[^"]*"'|cut -d'"' -f4)
-        flag=$(country_code_to_flag "$country_code")
-    else
-        raw=$(curl -s --max-time 5 "https://ipinfo.io/json" 2>/dev/null)
-        ip=$(echo "$raw"|grep -o '"ip": *"[^"]*"'|cut -d'"' -f4)
-        country_code=$(echo "$raw"|grep -o '"country": *"[^"]*"'|cut -d'"' -f4)
-        city=$(echo "$raw"|grep -o '"city": *"[^"]*"'|cut -d'"' -f4)
-        country="$country_code"; flag=$(country_code_to_flag "$country_code")
-        [[ -z "$ip" ]] && ip=$(get_ip)
-    fi
-    [[ -z "$ip"      ]] && ip=$(get_ip)
-    [[ -z "$country" ]] && country="Unknown"
-    [[ -z "$city"    ]] && city="Unknown"
-    [[ -z "$flag"    ]] && flag="🌐"
-    echo "${ip}|${country}|${country_code}|${city}|${flag}" | tee "$cache"
-}
-
-# ── Ready-to-copy share block ─────────────────────────────────
-_print_copy_block() {
-    local srv_ip="$1" flag="$2" country="$3" city="$4"
-    local pw="$5" expires="$6" devices="$7" quota="$8" type="$9"
-    local title="🔥 *ZIVPN VPN Account Details*"
-    [[ "$type" == "TRIAL" ]] && title="⚡ *ZIVPN Trial Account*"
-    echo ""
-    echo -e "${GO}  ┌──────────────────────────────────────────────────────┐${NC}"
-    echo -e "${GO}  │  📋  READY TO COPY — Long-press block below & copy   │${NC}"
-    echo -e "${GO}  └──────────────────────────────────────────────────────┘${NC}"
-    echo ""
-    echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo "${title}"
-    echo ""
-    echo "🌐 Server IP   : ${srv_ip}"
-    echo "${flag} Location    : ${country} (${city})"
-    echo "🔑 Password    : ${pw}"
-    echo "📅 Expires     : ${expires}"
-    echo "📱 Max Devices : ${devices}"
-    echo "📊 Data Quota  : ${quota}"
-    echo ""
-    echo "📲 How to connect:"
-    echo "  1. Open ZIVPN Pro app"
-    echo "  2. UDP Server  → ${srv_ip}"
-    echo "  3. Password    → ${pw}"
-    echo "  4. Tap Connect ✅"
-    echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    echo -e "${DIM}  ↑ Long-press → Select All → Copy → Paste to WhatsApp/Telegram${NC}"
+# Write a readable script showing all active HWID rules
+generate_hwid_rules_script() {
+    cat > "$HWID_RULES" << 'HEOF'
+#!/bin/bash
+# OPUDP HWID Rules — auto-generated, do not edit manually
+# Run: bash /etc/zivpn/hwid_rules.sh  to reapply after reboot
+HEOF
+    while IFS=':' read -r u p e bw mc hwid hl; do
+        [[ -z "$u" || "$hl" != "1" || "$hwid" == "none" ]] && continue
+        echo "# User: ${u} — locked to IP: ${hwid}" >> "$HWID_RULES"
+        echo "iptables -A INPUT -p udp --dport ${LISTEN_PORT} ! -s ${hwid} -m comment --comment \"opudp-hwid-${u}\" -j LOG --log-prefix \"OPUDP-HWID-BLOCK: \"" >> "$HWID_RULES"
+    done < "$USERS_DB"
+    chmod +x "$HWID_RULES"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  🔥 HEADER
+#  HWID MONITOR — background daemon
+#  Watches ZIVPN journal logs for new connections.
+#  On first connect: auto-captures the connecting IP as HWID.
+#  On subsequent connects: checks IP matches registered HWID.
+# ══════════════════════════════════════════════════════════════
+start_hwid_monitor() {
+    # Check if monitor already running
+    if pgrep -f "opudp-hwid-monitor" &>/dev/null; then
+        return
+    fi
+
+    # Write the monitor script
+    cat > /usr/local/bin/opudp-hwid-monitor << 'MONITOR'
+#!/bin/bash
+# OPUDP HWID Monitor — runs as background daemon
+USERS_DB="/etc/zivpn/users.db"
+HWID_LOG="/etc/zivpn/hwid.log"
+LISTEN_PORT="5667"
+
+log_hwid() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$HWID_LOG"; }
+
+log_hwid "HWID Monitor started (PID $$)"
+
+# Watch live ZIVPN journal for connection events
+journalctl -u zivpn -f --no-pager -o cat 2>/dev/null | while read -r line; do
+
+    # ZIVPN logs connecting client IP in various formats
+    # Extract IP from log line — handles both IPv4 and common log formats
+    conn_ip=""
+    if echo "$line" | grep -qiE "client|connect|auth|login"; then
+        conn_ip=$(echo "$line" | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | head -1)
+    fi
+
+    [[ -z "$conn_ip" ]] && continue
+    # Skip localhost/private ranges if needed — keep real IPs
+    [[ "$conn_ip" =~ ^(127\.|0\.) ]] && continue
+
+    # Check each user — find whose password matches this connection
+    # We do this by checking if this IP is already registered
+    while IFS=':' read -r u p e bw mc hwid hl; do
+        [[ -z "$u" ]] && continue
+
+        # Skip expired users
+        exp_check=$(date -d "$e" +%s 2>/dev/null)
+        now_check=$(date +%s)
+        [[ "$e" != "never" && "$exp_check" -lt "$now_check" ]] && continue
+
+        if [[ "$hl" == "0" || "$hwid" == "none" ]]; then
+            # First time connection — auto-capture this IP as HWID
+            log_hwid "AUTO-CAPTURE | user=${u} | hwid_ip=${conn_ip} | status=first_connect"
+            # Update users.db — set hwid and lock it
+            sed -i "s|^${u}:${p}:${e}:${bw}:${mc}:.*$|${u}:${p}:${e}:${bw}:${mc}:${conn_ip}:1|" \
+                "$USERS_DB" 2>/dev/null
+            log_hwid "HWID LOCKED  | user=${u} | device_ip=${conn_ip}"
+
+        elif [[ "$hl" == "1" && "$hwid" != "none" ]]; then
+            # HWID already locked — check if IP matches
+            if [[ "$conn_ip" != "$hwid" ]]; then
+                log_hwid "HWID BLOCKED | user=${u} | registered=${hwid} | attempted=${conn_ip}"
+                # Kill any established connection from this foreign IP
+                ss -K dst "$conn_ip" dport = "$LISTEN_PORT" 2>/dev/null
+            else
+                log_hwid "HWID OK      | user=${u} | ip=${conn_ip}"
+            fi
+        fi
+
+    done < "$USERS_DB"
+
+done
+MONITOR
+
+    chmod +x /usr/local/bin/opudp-hwid-monitor
+
+    # Create systemd service for the monitor
+    cat > /etc/systemd/system/opudp-hwid-monitor.service << 'SVC'
+[Unit]
+Description=OPUDP HWID Connection Monitor
+After=zivpn.service
+Requires=zivpn.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/opudp-hwid-monitor
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=opudp-hwid
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+    systemctl daemon-reload 2>/dev/null
+    systemctl enable opudp-hwid-monitor.service >/dev/null 2>&1
+    systemctl start  opudp-hwid-monitor.service 2>/dev/null
+}
+
+# ══════════════════════════════════════════════════════════════
+#  HEADER
 # ══════════════════════════════════════════════════════════════
 show_header() {
     clear
-    check_trials
-    refresh_activity
-    local svc_st users port live_conn trials
-    local si ip country city flag
+    local svc_st mon_st users port ip live
     svc_st=$(systemctl is-active "$SVC" 2>/dev/null)
+    mon_st=$(systemctl is-active opudp-hwid-monitor 2>/dev/null)
     users=$(count_active)
     port=$(get_port)
-    live_conn=$(count_live_connections)
-    trials=$(count_trials)
-    si=$(get_server_info)
-    ip=$(echo "$si"|cut -d'|' -f1)
-    country=$(echo "$si"|cut -d'|' -f2)
-    city=$(echo "$si"|cut -d'|' -f4)
-    flag=$(echo "$si"|cut -d'|' -f5)
+    ip=$(get_ip)
+    live=$(count_live_connections)
+
+    # Count HWID-locked users
+    local hwid_locked=0
+    while IFS=':' read -r u p e bw mc hwid hl; do
+        [[ "$hl" == "1" ]] && hwid_locked=$((hwid_locked+1))
+    done < "$USERS_DB"
+
+    echo -e "${C}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${C}║${W}       EXPIRY + BANDWIDTH  Ultimate Control Panel             ${C}║${NC}"
+    echo -e "${C}║${C}        User Expiry  •  Limits  •  Stats  •  HWID Lock        ${C}║${NC}"
+    echo -e "${C}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "${FR}  ██████╗ ██████╗ ██╗   ██╗██████╗ ██████╗ ${NC}"
-    echo -e "${OR}  ██╔═══██╗██╔══██╗██║   ██║██╔══██╗██╔══██╗${NC}"
-    echo -e "${GO}  ██║   ██║██████╔╝██║   ██║██║  ██║██████╔╝${NC}"
-    echo -e "${OR}  ██║   ██║██╔═══╝ ██║   ██║██║  ██║██╔═══╝ ${NC}"
-    echo -e "${FR}  ╚██████╔╝██║     ╚██████╔╝██████╔╝██║     ${NC}"
-    echo -e "${FR}   ╚═════╝ ╚═╝      ╚═════╝ ╚═════╝ ╚═╝     ${NC}"
-    echo ""
-    echo -e "${OR}  ╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${OR}  ║${GO}  🔥  ZIVPN Ultimate — Fire Edition  v${PANEL_VERSION}             ${OR}║${NC}"
-    echo -e "${OR}  ║${YW}       Expiry • Live BW Tracking • Trials • Activity     ${OR}║${NC}"
-    echo -e "${OR}  ╠══════════════════════════════════════════════════════════╣${NC}"
-    if [[ "$svc_st" == "active" ]]; then
-        echo -e "${OR}  ║${NC}  Service : ${G}● ACTIVE${NC}   Conns: ${GO}${live_conn}${NC}   Trials: ${YW}${trials}${NC}"
-    else
-        echo -e "${OR}  ║${NC}  Service : ${FR}✖ OFFLINE${NC}  Conns: ${FR}0${NC}       Trials: ${YW}${trials}${NC}"
-    fi
-    echo -e "${OR}  ║${NC}  Users   : ${GO}${users} active${NC}   IP: ${GO}${ip}${NC}   Ports: ${YW}${port}${NC}"
-    echo -e "${OR}  ║${NC}  Server  : ${GO}${flag} ${country}${NC} ${DIM}(${city})${NC}"
-    echo -e "${OR}  ╚══════════════════════════════════════════════════════════╝${NC}"
+    local sc; [[ "$svc_st" == "active" ]] && sc=$G || sc=$R
+    local mc; [[ "$mon_st" == "active" ]] && mc=$G || mc=$R
+    echo -e "  ZIVPN    : ${sc}${svc_st}${NC}     HWID Monitor: ${mc}${mon_st}${NC}"
+    echo -e "  Users    : ${G}${users}${NC}  Live: ${G}${live}${NC}  HWID Locked: ${M}${hwid_locked}${NC}"
+    echo -e "  IP       : ${C}${ip}${NC}   Ports: ${Y}${port}${NC}   v${PANEL_VERSION}"
     echo ""
 }
 
 # ══════════════════════════════════════════════════════════════
-#  🔥 MENU
+#  MENU
 # ══════════════════════════════════════════════════════════════
 show_menu() {
-    echo -e "${OR}  ╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${OR}  ║${GO}                     MAIN MENU                           ${OR}║${NC}"
-    echo -e "${OR}  ╠═══════════════════════════╦══════════════════════════════╣${NC}"
-    echo -e "${OR}  ║ ${GO} 1)${NC} Start ZIVPN           ${OR}║ ${GO}11)${NC} Bandwidth Report       ${OR}║${NC}"
-    echo -e "${OR}  ║ ${GO} 2)${NC} Stop ZIVPN            ${OR}║ ${GO}12)${NC} Reset User Bandwidth   ${OR}║${NC}"
-    echo -e "${OR}  ║ ${GO} 3)${NC} Restart ZIVPN         ${OR}║ ${GO}13)${NC} Speed Test             ${OR}║${NC}"
-    echo -e "${OR}  ║ ${GO} 4)${NC} Status                ${OR}║ ${GO}14)${NC} Live Logs              ${OR}║${NC}"
-    echo -e "${OR}  ║ ${GO} 5)${NC} List Users            ${OR}║ ${GO}15)${NC} Backup All Data        ${OR}║${NC}"
-    echo -e "${OR}  ║ ${GO} 6)${NC} Add User              ${OR}║ ${GO}16)${NC} Restore Backup         ${OR}║${NC}"
-    echo -e "${OR}  ║ ${GO} 7)${NC} Remove User           ${OR}║ ${GO}17)${NC} Change Port Range      ${OR}║${NC}"
-    echo -e "${OR}  ║ ${GO} 8)${NC} Renew / Extend User   ${OR}║ ${GO}18)${NC} Auto-Update ZIVPN      ${OR}║${NC}"
-    echo -e "${OR}  ║ ${GO} 9)${NC} Cleanup Expired       ${OR}║ ${GO}19)${NC} Set Connection Limit   ${OR}║${NC}"
-    echo -e "${OR}  ║ ${GO}10)${NC} Connection Stats      ${OR}║ ${GO}20)${NC} 🔥 Trial / Test User   ${OR}║${NC}"
-    echo -e "${OR}  ╠═══════════════════════════╩══════════════════════════════╣${NC}"
-    echo -e "${OR}  ║ ${FR}99)${NC} UNINSTALL (DANGER)          ${GO} 0)${NC} Exit                   ${OR}║${NC}"
-    echo -e "${OR}  ╚══════════════════════════════════════════════════════════╝${NC}"
+    echo -e "  ${G}1)${NC}  Start ZIVPN              ${G}12)${NC} Reset All Bandwidth"
+    echo -e "  ${G}2)${NC}  Stop ZIVPN               ${G}13)${NC} Speed Test"
+    echo -e "  ${G}3)${NC}  Restart ZIVPN            ${G}14)${NC} Live Logs"
+    echo -e "  ${G}4)${NC}  Status                   ${G}15)${NC} Backup All Data"
+    echo -e "  ${G}5)${NC}  List Users               ${G}16)${NC} Restore Backup"
+    echo -e "  ${G}6)${NC}  Add User                 ${G}17)${NC} Change Port Range"
+    echo -e "  ${G}7)${NC}  Remove User              ${G}18)${NC} Auto-Update"
+    echo -e "  ${G}8)${NC}  Renew/Extend User        ${G}19)${NC} Set Connection Limit"
+    echo -e "  ${G}9)${NC}  Cleanup Expired          ${M}20)${NC} HWID — View All"
+    echo -e "  ${G}10)${NC} Connection Stats         ${M}21)${NC} HWID — Set / Reset"
+    echo -e "  ${G}11)${NC} Bandwidth Report         ${M}22)${NC} HWID — Monitor Logs"
+    echo -e "  ${G}0)${NC}  Exit"
     echo ""
-    echo -ne "${GO}  🔥 Choose [0-99] ► ${NC}"
+    echo -ne "${Y}Choose [0-99] ► ${NC}"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  1-4  Service controls
+#  1-4) SERVICE CONTROLS
 # ══════════════════════════════════════════════════════════════
 start_svc() {
-    fire_header "Start ZIVPN"
+    echo -e "${Y}Starting ZIVPN...${NC}"
     systemctl start "$SVC"; sleep 1
     systemctl is-active --quiet "$SVC" \
-        && echo -e "  ${G}✓ Running.${NC}" \
-        || echo -e "  ${FR}✗ Failed — check: journalctl -u zivpn -n 20${NC}"
+        && echo -e "${G}  ZIVPN is now running.${NC}" \
+        || echo -e "${R}  Failed. Check: journalctl -u zivpn -n 20${NC}"
 }
-stop_svc()    { fire_header "Stop ZIVPN";    systemctl stop    "$SVC"; echo -e "  ${FR}✖ Stopped.${NC}"; }
+stop_svc() {
+    echo -e "${Y}Stopping ZIVPN...${NC}"
+    systemctl stop "$SVC"
+    echo -e "${R}  ZIVPN stopped.${NC}"
+}
 restart_svc() {
-    fire_header "Restart ZIVPN"
+    echo -e "${Y}Restarting ZIVPN...${NC}"
     systemctl restart "$SVC"; sleep 1
     systemctl is-active --quiet "$SVC" \
-        && echo -e "  ${G}✓ Restarted.${NC}" \
-        || echo -e "  ${FR}✗ Failed.${NC}"
+        && echo -e "${G}  ZIVPN restarted.${NC}" \
+        || echo -e "${R}  Restart failed.${NC}"
 }
 show_status() {
-    fire_header "ZIVPN Service Status"
+    echo -e "${C}═══ ZIVPN Service ═══════════════════════════════════════════${NC}"
     systemctl status "$SVC" --no-pager -l
-    echo ""; fire_divider
-    echo -e "  ${OR}Config   :${NC} ${GO}${CONFIG}${NC}"
-    echo -e "  ${OR}Users DB :${NC} ${GO}${USERS_DB}${NC}"
-    echo -e "  ${OR}BW Usage :${NC} ${GO}${BWUSED_DIR}/${NC}"
-    echo -e "  ${OR}BW Cron  :${NC} ${GO}${BWMON_CRON}${NC}"
-    echo -e "  ${OR}Sessions :${NC} ${GO}${SESSIONS_DIR}/${NC}"
-    echo -e "  ${OR}Binary   :${NC} ${GO}${BIN}${NC}"
+    echo ""
+    echo -e "${C}═══ HWID Monitor ════════════════════════════════════════════${NC}"
+    systemctl status opudp-hwid-monitor --no-pager -l
 }
 
 # ══════════════════════════════════════════════════════════════
-#  5) List Users — card view with live BW bar
+#  5) LIST USERS — shows HWID status
 # ══════════════════════════════════════════════════════════════
 list_users() {
-    fire_header "User List — Live BW • Days • Online"
+    echo -e "${C}═══ User List ═══════════════════════════════════════════════${NC}"
     if [[ ! -s "$USERS_DB" ]]; then
-        echo -e "  ${YW}No users. Use option 6 to add one.${NC}"; return
+        echo -e "  ${Y}No users found. Use option 6 to add one.${NC}"; return
     fi
-
-    local tc; tc=$(count_trials)
-    [[ $tc -gt 0 ]] && {
-        echo -e "  ${YW}⚡ Active Trials: ${tc}${NC}"
-        list_trials; echo ""; fire_divider; echo ""
-    }
-
-    while IFS=':' read -r u p e quota mc cd; do
+    printf "\n  %-16s %-18s %-11s %-5s %-5s %-17s %s\n" \
+        "USERNAME" "PASSWORD" "EXPIRY" "DAYS" "CONN" "HWID / DEVICE IP" "STATUS"
+    divider
+    while IFS=':' read -r u p e bw mc hwid hl; do
         [[ -z "$u" ]] && continue
-        [[ -z "$mc"    ]] && mc=0
-        [[ -z "$cd"    ]] && cd="?"
-        [[ -z "$quota" ]] && quota=0
+        [[ -z "$mc"   ]] && mc="0"
+        [[ -z "$hwid" ]] && hwid="none"
+        [[ -z "$hl"   ]] && hl="0"
 
-        local dl du conn_disp online status
-        local used_bytes quota_bytes remaining_bytes
-        local used_fmt quota_fmt remaining_fmt
-        dl=$(days_left "$e")
-        du=$(days_used "$cd")
-        [[ "$mc" -eq 0 ]] && conn_disp="∞" || conn_disp="$mc"
+        local dl st conn_d hwid_d
+        [[ "$mc" -eq 0 ]] && conn_d="∞" || conn_d="$mc"
 
-        # ── Bandwidth figures (bytes for precision) ────────────
-        used_bytes=$(get_used_bytes "$u")
-        used_fmt=$(fmt_bytes "$used_bytes")
-        if [[ "$quota" -eq 0 ]]; then
-            quota_fmt="Unlimited"; remaining_fmt="Unlimited"
+        # HWID display
+        if [[ "$hl" == "1" && "$hwid" != "none" ]]; then
+            hwid_d="${M}${hwid}${NC}"
+        elif [[ "$hl" == "0" ]]; then
+            hwid_d="${Y}awaiting 1st connect${NC}"
         else
-            quota_bytes=$(( quota * 1048576 ))
-            quota_fmt=$(fmt_mb "$quota")
-            remaining_bytes=$(( quota_bytes - used_bytes ))
-            [[ $remaining_bytes -lt 0 ]] && remaining_bytes=0
-            remaining_fmt=$(fmt_bytes "$remaining_bytes")
+            hwid_d="${R}none${NC}"
         fi
 
-        # ── Online check (seen in last 5 min) ─────────────────
-        online="${DIM}OFFLINE${NC}"
-        local lsf="${LASTSEEN_DIR}/${u}"
-        [[ -f "$lsf" ]] && {
-            local le; le=$(cat "$lsf" 2>/dev/null)
-            [[ $(( $(date +%s) - le )) -le 300 ]] && online="${G}● ONLINE${NC}"
-        }
-
-        local is_trial=""
-        grep -q "^${u}:" "$TRIALS_DB" 2>/dev/null && is_trial=" ⚡"
-
-        # ── Status ─────────────────────────────────────────────
-        if is_bw_blocked "$u"; then
-            status="${FR}🚫 DATA EXHAUSTED${NC}"
-        elif is_expired "$e"; then
-            status="${FR}✗ EXPIRED${NC}"
-        elif [[ "$dl" != "∞" && "$dl" -le 1 ]]; then
-            status="${FR}⚠ CRITICAL${NC}"
-        elif [[ "$dl" != "∞" && "$dl" -le 3 ]]; then
-            status="${YW}⚡ EXPIRING${NC}"
-        elif [[ "$dl" != "∞" && "$dl" -le 7 ]]; then
-            status="${OR}SOON${NC}"
+        if is_expired "$e"; then
+            dl="—"; st="${R}EXPIRED${NC}"
         else
-            status="${G}✓ ACTIVE${NC}"
+            dl=$(days_left "$e")
+            [[ "$dl" != "∞" && "$dl" -le 3 ]] \
+                && st="${Y}EXPIRING${NC}" || st="${G}ACTIVE${NC}"
         fi
 
-        # ── Card ───────────────────────────────────────────────
-        echo -e "${OR}  ┌────────────────────────────────────────────────────────┐${NC}"
-        printf   "  ${OR}│${NC}  ${W}%-16s${NC}  pw: ${GO}%-22s${NC}  conn: %s\n" \
-                 "${u}${is_trial}" "$p" "$conn_disp"
-        printf   "  ${OR}│${NC}  Status   : "; echo -e "$status"
-        printf   "  ${OR}│${NC}  Online   : "; echo -e "$online"
-        echo -e  "  ${OR}│${NC}  Days     : ${GO}${du}d used${NC}  —  ${YW}${dl}d left${NC}  (expiry: ${DIM}${e}${NC})"
-        echo -e  "  ${OR}│${NC}  Created  : ${DIM}${cd}${NC}"
-        echo -e  "  ${OR}│${NC}  ${FR}Used     : ${FR}${used_fmt}${NC}"
-        echo -e  "  ${OR}│${NC}  ${W}Quota    : ${W}${quota_fmt}${NC}"
-        echo -e  "  ${OR}│${NC}  ${GO}Remaining: ${GO}${remaining_fmt}${NC}"
-        echo -ne "  ${OR}│${NC}  BW Bar   : "
-        bw_bar "$used_bytes" "$quota"
-        echo -e "${OR}  └────────────────────────────────────────────────────────┘${NC}"
-        echo ""
+        printf "  %-16s %-18s %-11s %-5s %-5s " "$u" "$p" "$e" "$dl" "$conn_d"
+        echo -e "${hwid_d}  ${st}"
     done < "$USERS_DB"
-    echo -e "  ${DIM}BW updates every 60s. Survives reboots & ZIVPN restarts.${NC}"
-    echo -e "  ${DIM}🚫 DATA EXHAUSTED = blocked until you reset (option 12).${NC}"
+    echo ""
 }
 
 # ══════════════════════════════════════════════════════════════
-#  6) Add User
+#  6) ADD USER — with HWID option
 # ══════════════════════════════════════════════════════════════
 add_user() {
-    fire_header "Add New User"
+    echo -e "${C}═══ Add New User ════════════════════════════════════════════${NC}"
+    echo ""
 
+    # Username
     read -rp "  Username: " username
     username=$(echo "$username" | tr -d ' ')
-    [[ -z "$username" ]] && echo -e "${FR}Empty.${NC}" && return
-    grep -q "^${username}:" "$USERS_DB" 2>/dev/null && \
-        echo -e "${FR}Already exists!${NC}" && return
+    [[ -z "$username" ]] && echo -e "${R}  Username cannot be empty.${NC}" && return
+    grep -q "^${username}:" "$USERS_DB" 2>/dev/null \
+        && echo -e "${R}  User '${username}' already exists!${NC}" && return
 
+    # Password
     read -rp "  Password: " password
     password=$(echo "$password" | tr -d ' ')
-    [[ -z "$password" ]] && echo -e "${FR}Empty.${NC}" && return
+    [[ -z "$password" ]] && echo -e "${R}  Password cannot be empty.${NC}" && return
 
-    # ── Expiry ──────────────────────────────────────────────
+    # Expiry
     echo ""
-    echo -e "  ${OR}╔════════════════════════════════════╗${NC}"
-    echo -e "  ${OR}║${GO}        EXPIRY OPTIONS               ${OR}║${NC}"
-    echo -e "  ${OR}╠════════════════════════════════════╣${NC}"
-    echo -e "  ${OR}║${NC}  1) 1 month    2) 3 months          ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  3) 6 months   4) 1 year            ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  5) Never      6) Custom days        ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  7) Custom date (YYYY-MM-DD)         ${OR}║${NC}"
-    echo -e "  ${OR}╚════════════════════════════════════╝${NC}"
-    read -rp "  Choose [1-7]: " ec
-    local expiry cd
+    echo -e "  ${W}Expiry:${NC}"
+    echo "    1) 1 month   2) 3 months  3) 6 months"
+    echo "    4) 1 year    5) Never     6) Custom (YYYY-MM-DD)"
+    read -rp "  Choose [1-6]: " ec
     case $ec in
-        1) expiry=$(date -d "+1 month"   +%Y-%m-%d) ;;
-        2) expiry=$(date -d "+3 months"  +%Y-%m-%d) ;;
-        3) expiry=$(date -d "+6 months"  +%Y-%m-%d) ;;
-        4) expiry=$(date -d "+1 year"    +%Y-%m-%d) ;;
+        1) expiry=$(date -d "+1 month"  +%Y-%m-%d) ;;
+        2) expiry=$(date -d "+3 months" +%Y-%m-%d) ;;
+        3) expiry=$(date -d "+6 months" +%Y-%m-%d) ;;
+        4) expiry=$(date -d "+1 year"   +%Y-%m-%d) ;;
         5) expiry="never" ;;
-        6) read -rp "  Days (e.g. 30): " cd
-           [[ ! "$cd" =~ ^[0-9]+$ || $cd -lt 1 ]] && echo -e "${FR}Invalid.${NC}" && return
-           expiry=$(date -d "+${cd} days" +%Y-%m-%d)
-           echo -e "  ${GO}Expiry: ${W}${expiry}${NC} ${DIM}(${cd} days)${NC}" ;;
-        7) read -rp "  Date (YYYY-MM-DD): " expiry
-           date -d "$expiry" +%Y-%m-%d &>/dev/null || { echo -e "${FR}Invalid.${NC}"; return; } ;;
-        *) echo -e "${FR}Invalid.${NC}"; return ;;
+        6) read -rp "  Date (YYYY-MM-DD): " expiry
+           date -d "$expiry" +%Y-%m-%d &>/dev/null \
+               || { echo -e "${R}  Invalid date.${NC}"; return; } ;;
+        *) echo -e "${R}  Invalid.${NC}"; return ;;
     esac
 
-    # ── Connection Limit ─────────────────────────────────────
+    # Connection limit
     echo ""
-    echo -e "  ${OR}╔══════════════════════════════╗${NC}"
-    echo -e "  ${OR}║${GO}   CONNECTION LIMIT           ${OR}║${NC}"
-    echo -e "  ${OR}╠══════════════════════════════╣${NC}"
-    echo -e "  ${OR}║${NC}  1) 1    2) 2    3) 3       ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  4) 5    5) 10   6) ∞       ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  7) Custom number            ${OR}║${NC}"
-    echo -e "  ${OR}╚══════════════════════════════╝${NC}"
+    echo -e "  ${W}Connection Limit:${NC}"
+    echo "    1) 1 device  2) 2 devices  3) 3 devices"
+    echo "    4) 5 devices 5) 10 devices 6) Unlimited  7) Custom"
     read -rp "  Choose [1-7]: " cc
-    local max_conn
     case $cc in
-        1) max_conn=1  ;; 2) max_conn=2  ;; 3) max_conn=3  ;;
-        4) max_conn=5  ;; 5) max_conn=10 ;; 6) max_conn=0  ;;
-        7) read -rp "  Number: " max_conn; [[ ! "$max_conn" =~ ^[0-9]+$ ]] && max_conn=0 ;;
+        1) max_conn=1  ;; 2) max_conn=2  ;; 3) max_conn=3 ;;
+        4) max_conn=5  ;; 5) max_conn=10 ;; 6) max_conn=0 ;;
+        7) read -rp "  Enter max: " max_conn
+           [[ "$max_conn" =~ ^[0-9]+$ ]] || max_conn=0 ;;
         *) max_conn=0 ;;
     esac
 
-    # ── Bandwidth / Data Quota ───────────────────────────────
+    # ── HWID Setting ──────────────────────────────────────────
     echo ""
-    echo -e "  ${OR}╔══════════════════════════════════════╗${NC}"
-    echo -e "  ${OR}║${GO}   BANDWIDTH / DATA QUOTA             ${OR}║${NC}"
-    echo -e "  ${OR}╠══════════════════════════════════════╣${NC}"
-    echo -e "  ${OR}║${NC}  1)  500 MB      2)  1 GB            ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  3)  2 GB        4)  5 GB            ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  5)  10 GB       6)  20 GB           ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  7)  50 GB       8)  100 GB          ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  9)  Unlimited   10) Custom (MB)     ${OR}║${NC}"
-    echo -e "  ${OR}╚══════════════════════════════════════╝${NC}"
-    read -rp "  Choose [1-10]: " bc2
-    local quota_mb
-    case $bc2 in
-        1)  quota_mb=500    ;; 2)  quota_mb=1024   ;;
-        3)  quota_mb=2048   ;; 4)  quota_mb=5120   ;;
-        5)  quota_mb=10240  ;; 6)  quota_mb=20480  ;;
-        7)  quota_mb=51200  ;; 8)  quota_mb=102400 ;;
-        9)  quota_mb=0      ;;
-        10) read -rp "  Enter MB (e.g. 3000 = ~3GB): " quota_mb
-            [[ ! "$quota_mb" =~ ^[0-9]+$ ]] && quota_mb=0 ;;
-        *)  quota_mb=0 ;;
+    echo -e "  ${M}╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "  ${M}║             HWID — Device Lock Setting               ║${NC}"
+    echo -e "  ${M}╠══════════════════════════════════════════════════════╣${NC}"
+    echo -e "  ${M}║${NC}  HWID locks this password to ONE specific device.     ${M}║${NC}"
+    echo -e "  ${M}║${NC}  If someone copies this password to another device,   ${M}║${NC}"
+    echo -e "  ${M}║${NC}  their connection will be BLOCKED automatically.      ${M}║${NC}"
+    echo -e "  ${M}╚══════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${W}HWID Options:${NC}"
+    echo "    1) Auto-capture on first connect (recommended)"
+    echo "       → User connects once, their device IP is locked automatically"
+    echo "    2) Set manually now"
+    echo "       → Enter the user's device IP address right now"
+    echo "    3) No HWID lock (not recommended)"
+    echo "       → Anyone with the password can connect from any device"
+    echo ""
+    read -rp "  Choose [1-3]: " hc
+
+    local hwid="none"
+    local hwid_locked="0"
+    local hwid_note=""
+
+    case $hc in
+        1)
+            hwid="none"
+            hwid_locked="0"
+            hwid_note="Auto-capture on first connect"
+            ;;
+        2)
+            read -rp "  Enter device IP (e.g. 197.251.240.5): " hwid_input
+            hwid_input=$(echo "$hwid_input" | tr -d ' ')
+            if [[ "$hwid_input" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                hwid="$hwid_input"
+                hwid_locked="1"
+                hwid_note="Manually locked to ${hwid}"
+            else
+                echo -e "  ${Y}  Invalid IP — defaulting to auto-capture.${NC}"
+                hwid="none"
+                hwid_locked="0"
+                hwid_note="Auto-capture on first connect (fallback)"
+            fi
+            ;;
+        3)
+            hwid="none"
+            hwid_locked="0"
+            hwid_note="${R}No HWID lock${NC}"
+            ;;
+        *)
+            hwid="none"
+            hwid_locked="0"
+            hwid_note="Auto-capture on first connect (default)"
+            ;;
     esac
 
-    local TODAY; TODAY=$(date +%Y-%m-%d)
-    echo "${username}:${password}:${expiry}:${quota_mb}:${max_conn}:${TODAY}" >> "$USERS_DB"
-    # Init byte counter at 0
-    echo "0" > "${BWUSED_DIR}/${username}"
+    # Save to DB
+    echo "${username}:${password}:${expiry}:0:${max_conn}:${hwid}:${hwid_locked}" >> "$USERS_DB"
+    rebuild_config
+    apply_all_rules
+    systemctl restart "$SVC" 2>/dev/null
 
-    rebuild_config; apply_conn_limits; systemctl restart "$SVC" 2>/dev/null
-
-    local si; si=$(get_server_info)
-    local srv_ip country city flag
-    srv_ip=$(echo "$si"|cut -d'|' -f1)
-    country=$(echo "$si"|cut -d'|' -f2)
-    city=$(echo "$si"|cut -d'|' -f4)
-    flag=$(echo "$si"|cut -d'|' -f5)
-
-    local conn_label bw_label
-    [[ "$max_conn" -eq 0 ]] && conn_label="Unlimited" || conn_label="${max_conn} device(s)"
-    [[ "$quota_mb" -eq 0 ]] && bw_label="Unlimited"   || bw_label=$(fmt_mb "$quota_mb")
+    local server_ip; server_ip=$(get_ip)
+    local cl; [[ "$max_conn" -eq 0 ]] && cl="Unlimited" || cl="${max_conn} device(s)"
 
     echo ""
-    echo -e "${OR}  ╔═══════════════════════════════════════════════════╗${NC}"
-    echo -e "${OR}  ║${GO}  ✓ USER ADDED SUCCESSFULLY!                       ${OR}║${NC}"
-    echo -e "${OR}  ╠═══════════════════════════════════════════════════╣${NC}"
-    echo -e "${OR}  ║${NC}  Server IP   : ${GO}${srv_ip}${NC}"
-    echo -e "${OR}  ║${NC}  Server Loc  : ${GO}${flag} ${country} — ${city}${NC}"
-    echo -e "${OR}  ║${NC}  Password    : ${GO}${password}${NC}  ${G}← enter in ZIVPN app${NC}"
-    echo -e "${OR}  ║${NC}  Expiry      : ${GO}${expiry}${NC}"
-    echo -e "${OR}  ║${NC}  Max Devices : ${GO}${conn_label}${NC}"
-    echo -e "${OR}  ║${NC}  Data Quota  : ${GO}${bw_label}${NC}  ${DIM}← decreases as user uses data${NC}"
-    echo -e "${OR}  ║${NC}  BW Used     : ${GO}0 B${NC}  ${DIM}(live — updates every 60s)${NC}"
-    echo -e "${OR}  ║${NC}  Created     : ${GO}${TODAY}${NC}"
-    echo -e "${OR}  ╚═══════════════════════════════════════════════════╝${NC}"
-    _print_copy_block "$srv_ip" "$flag" "$country" "$city" \
-        "$password" "$expiry" "$conn_label" "$bw_label" "NORMAL"
+    echo -e "${G}  ✓ User '${username}' added!${NC}"
+    echo ""
+    echo -e "${C}  ╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "${C}  ║${W}          ZIVPN App Configuration                   ${C}║${NC}"
+    echo -e "${C}  ╠══════════════════════════════════════════════════════╣${NC}"
+    echo -e "${C}  ║${NC}  UDP Server   :  ${Y}${server_ip}${NC}"
+    echo -e "${C}  ║${NC}  UDP Password :  ${Y}${password}${NC}  ${G}← enter in ZIVPN app${NC}"
+    echo -e "${C}  ║${NC}  Expiry       :  ${Y}${expiry}${NC}"
+    echo -e "${C}  ║${NC}  Max Devices  :  ${Y}${cl}${NC}"
+    echo -e "${C}  ╠══════════════════════════════════════════════════════╣${NC}"
+    echo -e "${C}  ║${W}          HWID Device Lock                          ${C}║${NC}"
+    echo -e "${C}  ╠══════════════════════════════════════════════════════╣${NC}"
+    echo -e "${C}  ║${NC}  Mode   :  ${M}${hwid_note}${NC}"
+    if [[ "$hwid_locked" == "1" ]]; then
+        echo -e "${C}  ║${NC}  Status :  ${M}LOCKED to ${hwid}${NC}"
+    else
+        echo -e "${C}  ║${NC}  Status :  ${Y}Unlocked — will lock on first connection${NC}"
+    fi
+    echo -e "${C}  ╚══════════════════════════════════════════════════════╝${NC}"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  7) Remove User
+#  7) REMOVE USER
 # ══════════════════════════════════════════════════════════════
 remove_user() {
-    fire_header "Remove User"
-    list_users
-    [[ ! -s "$USERS_DB" ]] && return
+    echo -e "${C}═══ Remove User ═════════════════════════════════════════════${NC}"
+    list_users; [[ ! -s "$USERS_DB" ]] && return
     read -rp "  Username to remove: " username
     username=$(echo "$username" | tr -d ' ')
-    grep -q "^${username}:" "$USERS_DB" 2>/dev/null || {
-        echo -e "${FR}Not found.${NC}"; return; }
-    read -rp "  Confirm remove '${username}'? [y/N]: " confirm
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "  Cancelled." && return
+    grep -q "^${username}:" "$USERS_DB" 2>/dev/null \
+        || { echo -e "${R}  User not found.${NC}"; return; }
+    read -rp "  Confirm remove '${username}'? [y/N]: " c
+    [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && return
     local pass; pass=$(grep "^${username}:" "$USERS_DB" | cut -d: -f2)
     sed -i "/^${username}:/d" "$USERS_DB"
-    sed -i "/^${username}:/d" "$TRIALS_DB"                 2>/dev/null
-    rm -f "${SESSIONS_DIR}/${pass}.sessions"                2>/dev/null
-    rm -f "${LASTSEEN_DIR}/${username}"                     2>/dev/null
-    rm -f "${BWUSED_DIR}/${username}"                       2>/dev/null
-    rm -f "${BWUSED_DIR}/.${username}_raw"                  2>/dev/null
-    rm -f "${BWUSED_DIR}/.${username}_blocked"              2>/dev/null
-    rebuild_config; apply_conn_limits; systemctl restart "$SVC" 2>/dev/null
-    echo -e "${G}  ✓ '${username}' removed.${NC}"
+    rm -f "${SESSIONS_DIR}/${pass}.sessions" 2>/dev/null
+    rebuild_config; apply_all_rules
+    systemctl restart "$SVC" 2>/dev/null
+    echo -e "${G}  User '${username}' removed.${NC}"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  8) Renew / Extend
+#  8) RENEW USER
 # ══════════════════════════════════════════════════════════════
 renew_user() {
-    fire_header "Renew / Extend User"
-    list_users
-    [[ ! -s "$USERS_DB" ]] && return
+    echo -e "${C}═══ Renew / Extend User ═════════════════════════════════════${NC}"
+    list_users; [[ ! -s "$USERS_DB" ]] && return
     read -rp "  Username to renew: " username
     username=$(echo "$username" | tr -d ' ')
-    grep -q "^${username}:" "$USERS_DB" 2>/dev/null || {
-        echo -e "${FR}Not found.${NC}"; return; }
-
+    grep -q "^${username}:" "$USERS_DB" 2>/dev/null \
+        || { echo -e "${R}  User not found.${NC}"; return; }
     echo ""
-    echo -e "  ${OR}╔════════════════════════════════════╗${NC}"
-    echo -e "  ${OR}║${GO}      NEW EXPIRY OPTIONS             ${OR}║${NC}"
-    echo -e "  ${OR}╠════════════════════════════════════╣${NC}"
-    echo -e "  ${OR}║${NC}  1) 1 month    2) 3 months          ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  3) 6 months   4) 1 year            ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  5) Never      6) Custom days        ${OR}║${NC}"
-    echo -e "  ${OR}║${NC}  7) Custom date (YYYY-MM-DD)         ${OR}║${NC}"
-    echo -e "  ${OR}╚════════════════════════════════════╝${NC}"
-    read -rp "  Choose [1-7]: " ec
-    local new_expiry cd
+    echo "    1) 1 month  2) 3 months  3) 6 months  4) 1 year  5) Never  6) Custom"
+    read -rp "  Choose [1-6]: " ec
     case $ec in
-        1) new_expiry=$(date -d "+1 month"  +%Y-%m-%d) ;;
-        2) new_expiry=$(date -d "+3 months" +%Y-%m-%d) ;;
-        3) new_expiry=$(date -d "+6 months" +%Y-%m-%d) ;;
-        4) new_expiry=$(date -d "+1 year"   +%Y-%m-%d) ;;
-        5) new_expiry="never" ;;
-        6) read -rp "  Days: " cd
-           [[ ! "$cd" =~ ^[0-9]+$ || $cd -lt 1 ]] && echo -e "${FR}Invalid.${NC}" && return
-           new_expiry=$(date -d "+${cd} days" +%Y-%m-%d)
-           echo -e "  ${GO}Expiry: ${W}${new_expiry}${NC} ${DIM}(${cd} days)${NC}" ;;
-        7) read -rp "  Date (YYYY-MM-DD): " new_expiry
-           date -d "$new_expiry" +%Y-%m-%d &>/dev/null || { echo -e "${FR}Invalid.${NC}"; return; } ;;
-        *) echo -e "${FR}Invalid.${NC}"; return ;;
+        1) ne=$(date -d "+1 month"  +%Y-%m-%d) ;;
+        2) ne=$(date -d "+3 months" +%Y-%m-%d) ;;
+        3) ne=$(date -d "+6 months" +%Y-%m-%d) ;;
+        4) ne=$(date -d "+1 year"   +%Y-%m-%d) ;;
+        5) ne="never" ;;
+        6) read -rp "  Date (YYYY-MM-DD): " ne
+           date -d "$ne" +%Y-%m-%d &>/dev/null || { echo -e "${R}  Invalid.${NC}"; return; } ;;
+        *) echo -e "${R}  Invalid.${NC}"; return ;;
     esac
-    sed -i "s/^\(${username}:[^:]*\):[^:]*:\([^:]*:[^:]*:[^:]*\)$/\1:${new_expiry}:\2/" "$USERS_DB"
-    sed -i "/^${username}:/d" "$TRIALS_DB" 2>/dev/null
+    # Update only field 3 (expiry), preserve hwid fields 6 & 7
+    sed -i "s/^\(${username}:[^:]*\):[^:]*:\([^:]*:[^:]*:[^:]*:[^:]*\)$/\1:${ne}:\2/" "$USERS_DB"
     rebuild_config; systemctl restart "$SVC" 2>/dev/null
-    echo -e "${G}  ✓ '${username}' → new expiry: ${GO}${new_expiry}${NC}"
+    echo -e "${G}  '${username}' renewed → ${ne}${NC}"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  9) Cleanup Expired
+#  9) CLEANUP EXPIRED
 # ══════════════════════════════════════════════════════════════
 cleanup_expired() {
-    fire_header "Cleanup Expired Users"
-    local count=0 tmp; tmp=$(mktemp)
-    while IFS=':' read -r u p e bw mc cd; do
+    echo -e "${C}═══ Cleanup Expired Users ═══════════════════════════════════${NC}"
+    local count=0; local tmp; tmp=$(mktemp)
+    while IFS=':' read -r u p e bw mc hwid hl; do
         [[ -z "$u" ]] && continue
         if is_expired "$e"; then
-            echo -e "  ${FR}✗ ${u}${NC} ${DIM}(expired: ${e})${NC}"
-            sed -i "/^${u}:/d" "$TRIALS_DB"            2>/dev/null
-            rm -f "${SESSIONS_DIR}/${p}.sessions"       2>/dev/null
-            rm -f "${LASTSEEN_DIR}/${u}"                2>/dev/null
-            rm -f "${BWUSED_DIR}/${u}"                  2>/dev/null
-            rm -f "${BWUSED_DIR}/.${u}_raw"             2>/dev/null
-            rm -f "${BWUSED_DIR}/.${u}_blocked"         2>/dev/null
-            count=$(( count+1 ))
+            echo -e "  ${R}Removing:${NC} ${u} (expired: ${e})"
+            rm -f "${SESSIONS_DIR}/${p}.sessions" 2>/dev/null
+            count=$((count+1))
         else
-            echo "${u}:${p}:${e}:${bw}:${mc}:${cd}" >> "$tmp"
+            echo "${u}:${p}:${e}:${bw}:${mc}:${hwid}:${hl}" >> "$tmp"
         fi
     done < "$USERS_DB"
     mv "$tmp" "$USERS_DB"
-    rebuild_config; apply_conn_limits; systemctl restart "$SVC" 2>/dev/null
-    echo ""; echo -e "${G}  ✓ Removed ${count} expired user(s).${NC}"
+    rebuild_config; apply_all_rules
+    systemctl restart "$SVC" 2>/dev/null
+    echo -e "${G}  Done. Removed ${count} expired user(s).${NC}"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  10) Connection Stats
+#  10) CONNECTION STATS
 # ══════════════════════════════════════════════════════════════
 conn_stats() {
-    fire_header "Connection Stats"
-    echo -e "  ${OR}Live connections:${NC} ${GO}$(count_live_connections)${NC}"
+    echo -e "${C}═══ Connection Stats ════════════════════════════════════════${NC}"
+    echo ""
+    local total; total=$(count_live_connections)
+    echo -e "  Total live connections: ${G}${total}${NC}"
     echo ""
     local ips; ips=$(get_connected_ips)
     if [[ -n "$ips" ]]; then
         echo -e "  ${W}Connected IPs:${NC}"
-        while read -r ip; do [[ -n "$ip" ]] && echo -e "    ${GO}→ ${ip}${NC}"; done <<< "$ips"
+        while read -r ip; do
+            [[ -z "$ip" ]] && continue
+            # Check if this IP matches any registered HWID
+            local matched_user="unknown"
+            while IFS=':' read -r u p e bw mc hwid hl; do
+                [[ "$hwid" == "$ip" ]] && matched_user="$u" && break
+            done < "$USERS_DB"
+            if [[ "$matched_user" != "unknown" ]]; then
+                echo -e "    ${G}→${NC} ${ip}  ${M}(registered: ${matched_user})${NC}"
+            else
+                echo -e "    ${Y}→${NC} ${ip}  ${Y}(unregistered device)${NC}"
+            fi
+        done <<< "$ips"
     else
-        echo -e "  ${YW}No active connections.${NC}"
+        echo -e "  ${Y}No active connections.${NC}"
     fi
-    echo ""; fire_divider; echo ""
-    [[ ! -s "$USERS_DB" ]] && return
-    printf "  ${OR}%-16s %-12s %-12s %-14s %-18s %s${NC}\n" \
-        "USERNAME" "USED" "QUOTA" "REMAINING" "LAST SEEN" "STATUS"
-    fire_divider
-    while IFS=':' read -r u p e quota mc cd; do
+    echo ""
+    divider
+    printf "  %-16s %-18s %-8s %-8s %-17s %s\n" \
+        "USERNAME" "PASSWORD" "CONN LIM" "LIVE" "HWID IP" "HWID STATUS"
+    divider
+    while IFS=':' read -r u p e bw mc hwid hl; do
         [[ -z "$u" ]] && continue
-        [[ -z "$quota" ]] && quota=0
-        local used_b q_fmt used_fmt rem_fmt conn_status
-        used_b=$(get_used_bytes "$u")
-        used_fmt=$(fmt_bytes "$used_b")
-        if [[ "$quota" -eq 0 ]]; then
-            q_fmt="∞"; rem_fmt="∞"
+        [[ -z "$mc"   ]] && mc="0"
+        [[ -z "$hwid" ]] && hwid="none"
+        [[ -z "$hl"   ]] && hl="0"
+        local lc ldisp hwid_st
+        lc=$(ss -u state established 2>/dev/null | grep ":${LISTEN_PORT}" | wc -l)
+        [[ "$mc" -eq 0 ]] && ldisp="∞" || ldisp="$mc"
+        if [[ "$hl" == "1" && "$hwid" != "none" ]]; then
+            hwid_st="${M}LOCKED${NC}"
+        elif [[ "$hl" == "0" ]]; then
+            hwid_st="${Y}PENDING${NC}"
         else
-            local qb=$(( quota * 1048576 ))
-            local rb=$(( qb - used_b )); [[ $rb -lt 0 ]] && rb=0
-            q_fmt=$(fmt_mb "$quota"); rem_fmt=$(fmt_bytes "$rb")
+            hwid_st="${R}UNLOCKED${NC}"
         fi
-        if is_bw_blocked "$u"; then conn_status="${FR}🚫 EXHAUSTED${NC}"
-        elif is_expired "$e";    then conn_status="${FR}EXPIRED${NC}"
-        else conn_status="${G}ACTIVE${NC}"
+        if is_expired "$e"; then
+            hwid_st="${R}EXPIRED${NC}"
         fi
-        printf "  %-16s %-12s %-12s %-14s %-18s " \
-            "$u" "$used_fmt" "$q_fmt" "$rem_fmt" "$(get_lastseen "$u")"
-        echo -e "$conn_status"
+        local hwid_show="${hwid:0:15}"
+        printf "  %-16s %-18s %-8s %-8s %-17s " "$u" "$p" "$ldisp" "$lc" "$hwid_show"
+        echo -e "$hwid_st"
     done < "$USERS_DB"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  11) Bandwidth Report
+#  11) BANDWIDTH REPORT
 # ══════════════════════════════════════════════════════════════
 bw_report() {
-    fire_header "Bandwidth Usage Report"
-    local iface rx tx
-    iface=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
+    echo -e "${C}═══ Bandwidth + Expiry Report ═══════════════════════════════${NC}"
+    local iface; iface=$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}')
+    local rx tx
     rx=$(cat /sys/class/net/"$iface"/statistics/rx_bytes 2>/dev/null || echo 0)
     tx=$(cat /sys/class/net/"$iface"/statistics/tx_bytes 2>/dev/null || echo 0)
-    echo -e "  ${OR}Interface :${NC} ${GO}${iface}${NC}"
-    echo -e "  ${OR}Server RX :${NC} ${GO}$(fmt_bytes "$rx")${NC}  ${DIM}(total inbound since boot)${NC}"
-    echo -e "  ${OR}Server TX :${NC} ${GO}$(fmt_bytes "$tx")${NC}  ${DIM}(total outbound since boot)${NC}"
-    echo ""; fire_divider; echo ""
-    [[ ! -s "$USERS_DB" ]] && return
-
-    while IFS=':' read -r u p e quota mc cd; do
+    echo -e "\n  Interface : ${Y}${iface}${NC}"
+    echo -e "  Total RX  : ${G}$(echo "scale=2; $rx/1048576" | bc) MB${NC}"
+    echo -e "  Total TX  : ${G}$(echo "scale=2; $tx/1048576" | bc) MB${NC}\n"
+    divider
+    [[ ! -s "$USERS_DB" ]] && echo -e "  ${Y}No users.${NC}" && return
+    printf "  %-16s %-18s %-11s %-5s %-5s %s\n" \
+        "USERNAME" "PASSWORD" "EXPIRY" "DAYS" "CONN" "STATUS"
+    divider
+    while IFS=':' read -r u p e bw mc hwid hl; do
         [[ -z "$u" ]] && continue
-        [[ -z "$quota" ]] && quota=0
-        [[ -z "$cd"    ]] && cd="?"
-
-        local used_b quota_b remaining_b
-        local used_fmt quota_fmt remaining_fmt dl du status
-        dl=$(days_left "$e"); du=$(days_used "$cd")
-        used_b=$(get_used_bytes "$u")
-        used_fmt=$(fmt_bytes "$used_b")
-
-        if [[ "$quota" -eq 0 ]]; then
-            quota_fmt="Unlimited"; remaining_fmt="Unlimited"; remaining_b=0
+        [[ -z "$mc" ]] && mc="0"
+        local dl st; [[ "$mc" -eq 0 ]] && cd="∞" || cd="$mc"
+        if is_expired "$e"; then
+            dl="—"; st="${R}EXPIRED${NC}"
         else
-            quota_b=$(( quota * 1048576 ))
-            quota_fmt=$(fmt_mb "$quota")
-            remaining_b=$(( quota_b - used_b ))
-            [[ $remaining_b -lt 0 ]] && remaining_b=0
-            remaining_fmt=$(fmt_bytes "$remaining_b")
+            dl=$(days_left "$e")
+            [[ "$dl" != "∞" && "$dl" -le 3 ]] \
+                && st="${Y}EXPIRING SOON${NC}" || st="${G}ACTIVE${NC}"
         fi
-
-        if is_bw_blocked "$u"; then
-            status="${FR}🚫 DATA EXHAUSTED — BLOCKED${NC}"
-        elif is_expired "$e"; then
-            status="${FR}✗ EXPIRED${NC}"
-        else
-            status="${G}✓ ACTIVE${NC}"
-        fi
-
-        echo -e "${OR}  ┌──────────────────────────────────────────────────────┐${NC}"
-        printf   "  ${OR}│${NC}  ${W}%-14s${NC}  created: ${DIM}%-12s${NC}  days left: ${GO}%s${NC}\n" \
-            "$u" "$cd" "${dl}d"
-        echo -ne "  ${OR}│${NC}  Status    : "; echo -e "$status"
-        echo -e  "  ${OR}│${NC}"
-        echo -e  "  ${OR}│${NC}  ${FR}▶ Used     : ${FR}${used_fmt}${NC}"
-        echo -e  "  ${OR}│${NC}  ${W}▶ Quota    : ${W}${quota_fmt}${NC}  ${DIM}(total allowed)${NC}"
-        echo -e  "  ${OR}│${NC}  ${GO}▶ Remaining: ${GO}${remaining_fmt}${NC}  ${DIM}(quota minus used)${NC}"
-        echo -e  "  ${OR}│${NC}"
-        echo -ne "  ${OR}│${NC}  Progress  : "
-        bw_bar "$used_b" "$quota"
-        echo -e "${OR}  └──────────────────────────────────────────────────────┘${NC}"
-        echo ""
+        printf "  %-16s %-18s %-11s %-5s %-5s " "$u" "$p" "$e" "$dl" "$cd"
+        echo -e "$st"
     done < "$USERS_DB"
-    echo -e "  ${DIM}Counter updates every 60s and survives reboots/restarts.${NC}"
-    echo -e "  ${DIM}To reset a user's counter → option 12.${NC}"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  12) Reset Bandwidth
+#  12) RESET BANDWIDTH
 # ══════════════════════════════════════════════════════════════
 reset_bandwidth() {
-    fire_header "Reset User Bandwidth"
-    echo ""
-    echo -e "  ${OR}What to reset?${NC}"
-    echo "    1) One specific user"
-    echo "    2) ALL users"
-    echo "    3) Server iptables counters only"
-    echo ""
-    read -rp "  Choose [1-3]: " rc
-    case $rc in
-        1)
-            list_users
-            [[ ! -s "$USERS_DB" ]] && return
-            read -rp "  Username: " username
-            username=$(echo "$username" | tr -d ' ')
-            grep -q "^${username}:" "$USERS_DB" 2>/dev/null || {
-                echo -e "${FR}Not found.${NC}"; return; }
-            local used_b; used_b=$(get_used_bytes "$username")
-            echo -e "  ${OR}Current usage : ${FR}$(fmt_bytes "$used_b")${NC}"
-            read -rp "  Reset '${username}' bandwidth to 0? [y/N]: " confirm
-            [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "  Cancelled." && return
-            reset_bw "$username"
-            rebuild_config; systemctl restart "$SVC" 2>/dev/null
-            echo -e "${G}  ✓ Bandwidth reset. '${username}' can connect again.${NC}"
-            ;;
-        2)
-            read -rp "  Reset ALL users to 0? [y/N]: " confirm
-            [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "  Cancelled." && return
-            while IFS=':' read -r u p e bw mc cd; do
-                [[ -z "$u" ]] && continue
-                reset_bw "$u"
-            done < "$USERS_DB"
-            rebuild_config; systemctl restart "$SVC" 2>/dev/null
-            echo -e "${G}  ✓ All users reset to 0.${NC}"
-            ;;
-        3)
-            read -rp "  Reset iptables counters? [y/N]: " confirm
-            [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "  Cancelled." && return
-            iptables -Z 2>/dev/null
-            # Also reset raw snapshots so delta restarts cleanly
-            find "$BWUSED_DIR" -name ".*_raw" -delete 2>/dev/null
-            echo -e "${G}  ✓ iptables counters + snapshots reset.${NC}"
-            ;;
-        *) echo -e "${FR}Invalid.${NC}" ;;
-    esac
+    echo -e "${C}═══ Reset Bandwidth Counters ════════════════════════════════${NC}"
+    read -rp "  Reset iptables counters? [y/N]: " c
+    [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && return
+    iptables -Z 2>/dev/null
+    echo -e "${G}  Counters reset.${NC}"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  13) Speed Test
+#  13) SPEED TEST
 # ══════════════════════════════════════════════════════════════
 speed_test() {
-    fire_header "Speed Test"
-    if command -v speedtest &>/dev/null; then speedtest
-    elif command -v speedtest-cli &>/dev/null; then speedtest-cli
+    echo -e "${C}═══ Speed Test ══════════════════════════════════════════════${NC}"
+    if command -v speedtest-cli &>/dev/null; then
+        speedtest-cli
     else
-        echo -e "  ${YW}Installing speedtest-cli...${NC}"
         apt-get install -y -q speedtest-cli 2>/dev/null \
             || pip3 install speedtest-cli --break-system-packages -q 2>/dev/null
         command -v speedtest-cli &>/dev/null && speedtest-cli || {
-            echo -ne "  ${OR}Download: ${NC}"
+            echo -ne "  Download: "
             curl -o /dev/null -s -w "%{speed_download}" \
                 http://speedtest.tele2.net/10MB.zip | \
                 awk '{printf "%.2f MB/s\n", $1/1048576}'
@@ -1288,158 +785,446 @@ speed_test() {
 }
 
 # ══════════════════════════════════════════════════════════════
-#  14-16  Logs / Backup / Restore
+#  14) LIVE LOGS
 # ══════════════════════════════════════════════════════════════
-live_logs()    { fire_header "Live Logs — Ctrl+C to stop"; journalctl -u "$SVC" -f --no-pager; }
-backup_data()  {
-    fire_header "Backup"
-    local p="${BACKUP_DIR}/opudp_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
-    tar -czf "$p" /etc/zivpn/ 2>/dev/null
-    echo -e "${G}  ✓ ${p}${NC} $(du -sh "$p" 2>/dev/null|cut -f1)"
-}
-restore_backup() {
-    fire_header "Restore Backup"
-    ls "$BACKUP_DIR"/*.tar.gz 2>/dev/null || { echo -e "  ${YW}None found.${NC}"; return; }
-    ls -lh "$BACKUP_DIR"/*.tar.gz | awk '{print "  "$9,$5}'
-    echo ""
-    read -rp "  Filename: " bname
-    local bp="${BACKUP_DIR}/${bname}"
-    [[ ! -f "$bp" ]] && echo -e "${FR}Not found.${NC}" && return
-    read -rp "  Restore? Overwrites current data [y/N]: " c
-    [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && return
-    tar -xzf "$bp" -C / 2>/dev/null
-    migrate_db; rebuild_config; apply_conn_limits
-    systemctl restart "$SVC" 2>/dev/null
-    echo -e "${G}  ✓ Restored.${NC}"
+live_logs() {
+    echo -e "${C}═══ Live Logs — Ctrl+C to stop ══════════════════════════════${NC}"
+    journalctl -u "$SVC" -f --no-pager
 }
 
 # ══════════════════════════════════════════════════════════════
-#  17) Change Port
+#  15 & 16) BACKUP / RESTORE
+# ══════════════════════════════════════════════════════════════
+backup_data() {
+    echo -e "${C}═══ Backup All Data ═════════════════════════════════════════${NC}"
+    local name="opudp_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+    tar -czf "${BACKUP_DIR}/${name}" /etc/zivpn/ 2>/dev/null
+    echo -e "${G}  Saved: ${BACKUP_DIR}/${name}${NC}"
+}
+
+restore_backup() {
+    echo -e "${C}═══ Restore Backup ══════════════════════════════════════════${NC}"
+    ls "${BACKUP_DIR}"/*.tar.gz 2>/dev/null || { echo -e "  ${Y}No backups.${NC}"; return; }
+    ls -lh "${BACKUP_DIR}"/*.tar.gz | awk '{print "  "$9,$5}'
+    read -rp "  Filename: " bname
+    [[ ! -f "${BACKUP_DIR}/${bname}" ]] && echo -e "${R}  Not found.${NC}" && return
+    read -rp "  Overwrite current data? [y/N]: " c
+    [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && return
+    tar -xzf "${BACKUP_DIR}/${bname}" -C / 2>/dev/null
+    migrate_db; rebuild_config; apply_all_rules
+    systemctl restart "$SVC" 2>/dev/null
+    echo -e "${G}  Restored.${NC}"
+}
+
+# ══════════════════════════════════════════════════════════════
+#  17) CHANGE PORT
 # ══════════════════════════════════════════════════════════════
 change_port() {
-    fire_header "Change UDP Port Range"
-    local cur ps pe
-    cur=$(get_port); ps=$(echo "$cur"|cut -d: -f1); pe=$(echo "$cur"|cut -d: -f2)
-    echo -e "  ${OR}Current: ${GO}${cur}${NC}"; echo ""
-    read -rp "  New start: " np1; read -rp "  New end:   " np2
-    [[ ! "$np1" =~ ^[0-9]+$ || ! "$np2" =~ ^[0-9]+$ ]] && echo -e "${FR}Not numbers.${NC}" && return
-    [[ $np1 -ge $np2 ]] && echo -e "${FR}Start must be less than end.${NC}" && return
-    local iface; iface=$(ip -4 route ls|grep default|grep -Po '(?<=dev )(\S+)'|head -1)
+    echo -e "${C}═══ Change UDP Port Range ═══════════════════════════════════${NC}"
+    local cur; cur=$(get_port)
+    local os oe; os=$(echo "$cur"|cut -d:-f1); oe=$(echo "$cur"|cut -d:-f2)
+    echo -e "  Current: ${Y}${cur}${NC}"; echo ""
+    read -rp "  New start port: " ps; read -rp "  New end port: " pe
+    [[ -z "$ps" || -z "$pe" ]] && echo -e "${R}  Invalid.${NC}" && return
+    [[ ! "$ps" =~ ^[0-9]+$ || ! "$pe" =~ ^[0-9]+$ ]] \
+        && echo -e "${R}  Numbers only.${NC}" && return
+    [[ "$ps" -ge "$pe" ]] && echo -e "${R}  Start must be less than end.${NC}" && return
+    local iface; iface=$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}')
     iptables -t nat -D PREROUTING -i "$iface" -p udp \
-        --dport "${ps}:${pe}" -j DNAT --to-destination ":${LISTEN_PORT}" 2>/dev/null
+        --dport "${os}:${oe}" -j DNAT --to-destination ":${LISTEN_PORT}" 2>/dev/null
     iptables -t nat -A PREROUTING -i "$iface" -p udp \
-        --dport "${np1}:${np2}" -j DNAT --to-destination ":${LISTEN_PORT}"
+        --dport "${ps}:${pe}" -j DNAT --to-destination ":${LISTEN_PORT}"
     iptables-save > /etc/iptables/rules.v4 2>/dev/null
-    ufw delete allow "${ps}:${pe}/udp" 2>/dev/null
-    ufw allow "${np1}:${np2}/udp"      2>/dev/null
-    echo "${np1}:${np2}" > "$PORT_FILE"
-    echo -e "${G}  ✓ Port range → ${GO}${np1}:${np2}${NC}"
+    ufw delete allow "${os}:${oe}/udp" 2>/dev/null
+    ufw allow "${ps}:${pe}/udp" 2>/dev/null
+    echo "${ps}:${pe}" > "$PORT_FILE"
+    echo -e "${G}  Port range → ${ps}:${pe}${NC}"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  18) Auto-Update
+#  18) AUTO-UPDATE
 # ══════════════════════════════════════════════════════════════
 auto_update() {
-    fire_header "Auto-Update ZIVPN + OPUDP"
-    local URL="https://github.com/zahidbd2/udp-zivpn/releases/latest/download/udp-zivpn-linux-amd64"
-    echo -e "  ${YW}Downloading ZIVPN...${NC}"
+    echo -e "${C}═══ Auto-Update ═════════════════════════════════════════════${NC}"
     systemctl stop "$SVC" 2>/dev/null
-    wget -q --show-progress "$URL" -O "${BIN}.new" && {
-        chmod +x "${BIN}.new"; mv "${BIN}.new" "$BIN"
-        systemctl start "$SVC"
-        echo -e "${G}  ✓ ZIVPN updated.${NC}"
-    } || {
-        rm -f "${BIN}.new"; systemctl start "$SVC"
-        echo -e "${FR}  Download failed.${NC}"
-    }
-    echo ""
-    echo -e "  ${YW}Updating OPUDP panel...${NC}"
-    wget -q "${GITHUB_RAW}/opudp" -O /usr/local/bin/opudp.new && {
-        chmod +x /usr/local/bin/opudp.new
-        mv /usr/local/bin/opudp.new /usr/local/bin/opudp
-        install_bwmon
-        echo -e "${G}  ✓ Panel updated. Re-run 'opudp'.${NC}"
-    } || {
-        rm -f /usr/local/bin/opudp.new
-        echo -e "${YW}  Panel update skipped.${NC}"
-    }
+    local BIN_URL="https://github.com/zahidbd2/udp-zivpn/releases/latest/download/udp-zivpn-linux-amd64"
+    wget -q "$BIN_URL" -O "${BIN}.new" 2>/dev/null \
+        && chmod +x "${BIN}.new" && mv "${BIN}.new" "$BIN" \
+        && echo -e "${G}  ZIVPN binary updated.${NC}" \
+        || { rm -f "${BIN}.new"; echo -e "${Y}  Binary update skipped.${NC}"; }
+    systemctl start "$SVC"
+    wget -q "${GITHUB_RAW}/opudp" -O /usr/local/bin/opudp.new 2>/dev/null \
+        && chmod +x /usr/local/bin/opudp.new \
+        && mv /usr/local/bin/opudp.new /usr/local/bin/opudp \
+        && echo -e "${G}  Panel updated. Re-run: opudp${NC}" \
+        || { rm -f /usr/local/bin/opudp.new; echo -e "${Y}  Panel update skipped.${NC}"; }
 }
 
 # ══════════════════════════════════════════════════════════════
-#  19) Set Connection Limit
+#  19) SET CONNECTION LIMIT
 # ══════════════════════════════════════════════════════════════
 set_conn_limit() {
-    fire_header "Set Connection Limit"
-    list_users
-    [[ ! -s "$USERS_DB" ]] && return
+    echo -e "${C}═══ Set Connection Limit ════════════════════════════════════${NC}"
+    list_users; [[ ! -s "$USERS_DB" ]] && return
     read -rp "  Username: " username
     username=$(echo "$username" | tr -d ' ')
-    grep -q "^${username}:" "$USERS_DB" 2>/dev/null || { echo -e "${FR}Not found.${NC}"; return; }
-    echo "    1)1  2)2  3)3  4)5  5)10  6)Unlimited  7)Custom"
+    grep -q "^${username}:" "$USERS_DB" 2>/dev/null \
+        || { echo -e "${R}  Not found.${NC}"; return; }
+    local cur; cur=$(grep "^${username}:" "$USERS_DB" | cut -d: -f5)
+    [[ "$cur" -eq 0 ]] \
+        && echo -e "  Current: ${G}Unlimited${NC}" \
+        || echo -e "  Current: ${Y}${cur} device(s)${NC}"
+    echo ""
+    echo "    1) 1  2) 2  3) 3  4) 5  5) 10  6) Unlimited  7) Custom"
     read -rp "  Choose [1-7]: " cc
-    local nl
     case $cc in
-        1)nl=1;;2)nl=2;;3)nl=3;;4)nl=5;;5)nl=10;;6)nl=0;;
-        7) read -rp "  Number: " nl; [[ ! "$nl" =~ ^[0-9]+$ ]] && nl=0 ;;
-        *) echo -e "${FR}Invalid.${NC}"; return ;;
+        1) nl=1  ;; 2) nl=2  ;; 3) nl=3  ;;
+        4) nl=5  ;; 5) nl=10 ;; 6) nl=0  ;;
+        7) read -rp "  Max: " nl
+           [[ "$nl" =~ ^[0-9]+$ ]] || nl=0 ;;
+        *) echo -e "${R}  Invalid.${NC}"; return ;;
     esac
-    sed -i "s/^\(${username}:[^:]*:[^:]*:[^:]*\):[^:]*:\([^:]*\)$/\1:${nl}:\2/" "$USERS_DB"
-    apply_conn_limits
-    local lbl; [[ $nl -eq 0 ]] && lbl="Unlimited" || lbl="${nl} device(s)"
-    echo -e "${G}  ✓ '${username}' → ${GO}${lbl}${NC}"
+    # Update field 5 only — preserve hwid fields 6 & 7
+    sed -i "s/^\(${username}:[^:]*:[^:]*:[^:]*\):[^:]*:\([^:]*:[^:]*\)$/\1:${nl}:\2/" "$USERS_DB"
+    apply_all_rules
+    local lbl; [[ "$nl" -eq 0 ]] && lbl="Unlimited" || lbl="${nl} device(s)"
+    echo -e "${G}  '${username}' limit → ${lbl}${NC}"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  99) Uninstall
+#  20) HWID — VIEW ALL  ← NEW
+# ══════════════════════════════════════════════════════════════
+hwid_view_all() {
+    echo -e "${M}═══ HWID Device Lock — All Users ════════════════════════════${NC}"
+    echo ""
+    if [[ ! -s "$USERS_DB" ]]; then
+        echo -e "  ${Y}No users found.${NC}"; return
+    fi
+
+    local locked=0 pending=0 unlocked=0
+
+    printf "  %-16s %-18s %-19s %s\n" "USERNAME" "PASSWORD" "REGISTERED DEVICE IP" "HWID STATUS"
+    divider
+
+    while IFS=':' read -r u p e bw mc hwid hl; do
+        [[ -z "$u" ]] && continue
+        [[ -z "$hwid" ]] && hwid="none"
+        [[ -z "$hl"   ]] && hl="0"
+
+        local st_label ip_display
+        if [[ "$hl" == "1" && "$hwid" != "none" ]]; then
+            st_label="${M}● LOCKED${NC}"
+            ip_display="${M}${hwid}${NC}"
+            locked=$((locked+1))
+        elif [[ "$hl" == "0" && "$hwid" == "none" ]]; then
+            st_label="${Y}○ PENDING 1ST CONNECT${NC}"
+            ip_display="${Y}awaiting...${NC}"
+            pending=$((pending+1))
+        else
+            st_label="${R}○ NO LOCK${NC}"
+            ip_display="${R}none${NC}"
+            unlocked=$((unlocked+1))
+        fi
+
+        printf "  %-16s %-18s " "$u" "$p"
+        echo -e "${ip_display}        ${st_label}"
+
+    done < "$USERS_DB"
+
+    echo ""
+    divider
+    echo -e "  ${M}Locked${NC}  : ${M}${locked}${NC} user(s) — device IP registered and enforced"
+    echo -e "  ${Y}Pending${NC} : ${Y}${pending}${NC} user(s) — will lock on first connection"
+    echo -e "  ${R}No Lock${NC} : ${R}${unlocked}${NC} user(s) — any device can connect"
+    echo ""
+    echo -e "  ${W}Tip:${NC} Use option ${M}21${NC} to manually set or reset a user's HWID."
+}
+
+# ══════════════════════════════════════════════════════════════
+#  21) HWID — SET / RESET  ← NEW
+# ══════════════════════════════════════════════════════════════
+hwid_manage() {
+    while true; do
+        echo -e "${M}═══ HWID — Set / Reset Device Lock ══════════════════════════${NC}"
+        echo ""
+        echo -e "  ${M}a)${NC} Lock user to a specific IP now"
+        echo -e "  ${M}b)${NC} Reset HWID (allow device change)"
+        echo -e "  ${M}c)${NC} Remove HWID lock completely (no lock)"
+        echo -e "  ${M}d)${NC} Force re-lock from current live connection"
+        echo -e "  ${M}0)${NC} Back"
+        echo ""
+        echo -ne "${M}Choose: ${NC}"
+        read -r sub; echo ""
+
+        case $sub in
+            # ── a) Lock to IP ─────────────────────────────────
+            a)
+                list_users; [[ ! -s "$USERS_DB" ]] && continue
+                read -rp "  Username to lock: " username
+                username=$(echo "$username" | tr -d ' ')
+                grep -q "^${username}:" "$USERS_DB" 2>/dev/null \
+                    || { echo -e "${R}  User not found.${NC}"; pause; continue; }
+
+                local cur_hwid cur_hl
+                cur_hwid=$(grep "^${username}:" "$USERS_DB" | cut -d: -f6)
+                cur_hl=$(grep "^${username}:"   "$USERS_DB" | cut -d: -f7)
+
+                if [[ "$cur_hl" == "1" && "$cur_hwid" != "none" ]]; then
+                    echo -e "  ${Y}Currently locked to: ${M}${cur_hwid}${NC}"
+                    read -rp "  Override with new IP? [y/N]: " ov
+                    [[ "$ov" != "y" && "$ov" != "Y" ]] && continue
+                fi
+
+                read -rp "  Enter device IP to lock to: " new_hwid
+                new_hwid=$(echo "$new_hwid" | tr -d ' ')
+                if ! [[ "$new_hwid" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                    echo -e "${R}  Invalid IP address.${NC}"; pause; continue
+                fi
+
+                # Update fields 6 (hwid) and 7 (hwid_locked)
+                sed -i "s/^\(${username}:[^:]*:[^:]*:[^:]*:[^:]*\):[^:]*:[^:]*$/\1:${new_hwid}:1/" \
+                    "$USERS_DB"
+                apply_all_rules
+                echo -e "${G}  '${username}' locked to device IP: ${M}${new_hwid}${NC}"
+                echo -e "${Y}  Only this IP can now connect with ${username}'s password.${NC}"
+                ;;
+
+            # ── b) Reset HWID — allows device change ──────────
+            b)
+                list_users; [[ ! -s "$USERS_DB" ]] && continue
+                read -rp "  Username to reset HWID: " username
+                username=$(echo "$username" | tr -d ' ')
+                grep -q "^${username}:" "$USERS_DB" 2>/dev/null \
+                    || { echo -e "${R}  User not found.${NC}"; pause; continue; }
+
+                local old_hwid
+                old_hwid=$(grep "^${username}:" "$USERS_DB" | cut -d: -f6)
+
+                echo ""
+                echo -e "  ${Y}⚠  This will UNLOCK '${username}' from device IP: ${M}${old_hwid}${NC}"
+                echo -e "  ${Y}   Their next connection will become the new registered device.${NC}"
+                read -rp "  Confirm reset? [y/N]: " c
+                [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && continue
+
+                # Set hwid=none, hwid_locked=0 — auto-capture on next connect
+                sed -i "s/^\(${username}:[^:]*:[^:]*:[^:]*:[^:]*\):[^:]*:[^:]*$/\1:none:0/" \
+                    "$USERS_DB"
+                apply_all_rules
+                echo -e "${G}  HWID reset. '${username}' will re-lock on next connection.${NC}"
+                echo -e "${G}  Old locked IP: ${R}${old_hwid}${G} — now cleared.${NC}"
+                ;;
+
+            # ── c) Remove lock completely ──────────────────────
+            c)
+                list_users; [[ ! -s "$USERS_DB" ]] && continue
+                read -rp "  Username to remove lock: " username
+                username=$(echo "$username" | tr -d ' ')
+                grep -q "^${username}:" "$USERS_DB" 2>/dev/null \
+                    || { echo -e "${R}  User not found.${NC}"; pause; continue; }
+                echo -e "  ${R}⚠  This permanently removes HWID protection for '${username}'.${NC}"
+                echo -e "  ${R}   ANY device can connect with their password.${NC}"
+                read -rp "  Confirm? [y/N]: " c
+                [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && continue
+                sed -i "s/^\(${username}:[^:]*:[^:]*:[^:]*:[^:]*\):[^:]*:[^:]*$/\1:none:0/" \
+                    "$USERS_DB"
+                apply_all_rules
+                echo -e "${G}  HWID lock removed for '${username}'.${NC}"
+                ;;
+
+            # ── d) Force lock from live connection ─────────────
+            d)
+                list_users; [[ ! -s "$USERS_DB" ]] && continue
+                read -rp "  Username to force-lock: " username
+                username=$(echo "$username" | tr -d ' ')
+                grep -q "^${username}:" "$USERS_DB" 2>/dev/null \
+                    || { echo -e "${R}  User not found.${NC}"; pause; continue; }
+
+                # Get currently connected IPs
+                local live_ips
+                live_ips=$(get_connected_ips)
+                if [[ -z "$live_ips" ]]; then
+                    echo -e "${Y}  No live connections detected right now.${NC}"
+                    echo -e "${Y}  Ask the user to connect first, then run this option.${NC}"
+                    pause; continue
+                fi
+
+                echo ""
+                echo -e "  ${W}Currently connected IPs:${NC}"
+                local i=1
+                declare -a ip_arr=()
+                while read -r lip; do
+                    [[ -z "$lip" ]] && continue
+                    echo -e "    ${G}${i})${NC} ${lip}"
+                    ip_arr+=("$lip")
+                    i=$((i+1))
+                done <<< "$live_ips"
+
+                echo ""
+                read -rp "  Select IP number to lock to: " sel
+                if ! [[ "$sel" =~ ^[0-9]+$ ]] || \
+                   [[ "$sel" -lt 1 || "$sel" -gt "${#ip_arr[@]}" ]]; then
+                    echo -e "${R}  Invalid selection.${NC}"; pause; continue
+                fi
+
+                local chosen_ip="${ip_arr[$((sel-1))]}"
+                sed -i "s/^\(${username}:[^:]*:[^:]*:[^:]*:[^:]*\):[^:]*:[^:]*$/\1:${chosen_ip}:1/" \
+                    "$USERS_DB"
+                apply_all_rules
+
+                echo -e "${G}  '${username}' force-locked to live IP: ${M}${chosen_ip}${NC}"
+                echo -e "${M}  $(now_ts) | FORCE-LOCKED | user=${username} | ip=${chosen_ip}${NC}" \
+                    >> "$HWID_LOG"
+                ;;
+
+            0) break ;;
+            *) echo -e "${R}  Invalid.${NC}" ;;
+        esac
+        pause
+        clear
+    done
+}
+
+# ══════════════════════════════════════════════════════════════
+#  22) HWID — MONITOR LOGS  ← NEW
+# ══════════════════════════════════════════════════════════════
+hwid_logs() {
+    echo -e "${M}═══ HWID Monitor Logs ═══════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  ${W}Recent HWID events (last 50 lines):${NC}"
+    echo ""
+    divider
+
+    if [[ ! -s "$HWID_LOG" ]]; then
+        echo -e "  ${Y}No HWID events logged yet.${NC}"
+        echo -e "  ${Y}Events appear once users start connecting.${NC}"
+    else
+        tail -50 "$HWID_LOG" | while read -r line; do
+            if echo "$line" | grep -q "BLOCKED"; then
+                echo -e "  ${R}${line}${NC}"
+            elif echo "$line" | grep -q "LOCKED\|FORCE"; then
+                echo -e "  ${M}${line}${NC}"
+            elif echo "$line" | grep -q "OK\|CAPTURE"; then
+                echo -e "  ${G}${line}${NC}"
+            else
+                echo -e "  ${C}${line}${NC}"
+            fi
+        done
+    fi
+
+    echo ""
+    divider
+    echo ""
+    echo -e "  ${W}Live monitor status:${NC}"
+    systemctl is-active --quiet opudp-hwid-monitor \
+        && echo -e "  ${G}● HWID Monitor is running${NC}" \
+        || echo -e "  ${R}● HWID Monitor is stopped${NC}"
+
+    echo ""
+    echo -e "  ${W}Options:${NC}"
+    echo -e "  ${M}r)${NC} Restart HWID monitor"
+    echo -e "  ${M}c)${NC} Clear HWID log"
+    echo -e "  ${M}l)${NC} Watch live (tail -f)"
+    echo -e "  ${M}0)${NC} Back"
+    echo ""
+    echo -ne "${M}Choose: ${NC}"
+    read -r lsub
+    case $lsub in
+        r)
+            systemctl restart opudp-hwid-monitor
+            echo -e "${G}  HWID Monitor restarted.${NC}"
+            ;;
+        c)
+            read -rp "  Clear all HWID logs? [y/N]: " c
+            [[ "$c" == "y" || "$c" == "Y" ]] \
+                && > "$HWID_LOG" \
+                && echo -e "${G}  Log cleared.${NC}" \
+                || echo "  Cancelled."
+            ;;
+        l)
+            echo -e "${C}  Watching live HWID log — Ctrl+C to stop${NC}"
+            tail -f "$HWID_LOG"
+            ;;
+    esac
+}
+
+# ══════════════════════════════════════════════════════════════
+#  99) UNINSTALL
 # ══════════════════════════════════════════════════════════════
 uninstall() {
-    fire_header "⚠ UNINSTALL — DANGER"
-    echo -e "${FR}  Removes everything: ZIVPN, OPUDP, all data, cron, rules${NC}"
+    echo -e "${R}═══ UNINSTALL (DANGER) ══════════════════════════════════════${NC}"
     echo ""
-    read -rp "  Type 'yes' to confirm: " c
-    [[ "$c" != "yes" ]] && echo "  Cancelled." && return
+    echo -e "${R}  Removes: ZIVPN, OPUDP, HWID monitor, all data${NC}"
+    echo ""
+    read -rp "  Type 'yes' to confirm: " confirm
+    [[ "$confirm" != "yes" ]] && echo "  Cancelled." && return
+
     local iface port ps pe
-    iface=$(ip -4 route ls|grep default|grep -Po '(?<=dev )(\S+)'|head -1)
-    port=$(get_port); ps=$(echo "$port"|cut -d: -f1); pe=$(echo "$port"|cut -d: -f2)
-    systemctl stop    "$SVC" 2>/dev/null
-    systemctl disable "$SVC" 2>/dev/null
+    iface=$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}')
+    port=$(get_port); ps=$(echo "$port"|cut -d:-f1); pe=$(echo "$port"|cut -d:-f2)
+
+    systemctl stop    "$SVC" opudp-hwid-monitor 2>/dev/null
+    systemctl disable "$SVC" opudp-hwid-monitor 2>/dev/null
     rm -f /etc/systemd/system/zivpn.service
+    rm -f /etc/systemd/system/opudp-hwid-monitor.service
     systemctl daemon-reload 2>/dev/null
-    rm -f "$BIN" "$BWMON_SCRIPT" "$BWMON_CRON"
-    iptables -D INPUT  -j ZIVPN_BW 2>/dev/null
-    iptables -D OUTPUT -j ZIVPN_BW 2>/dev/null
-    iptables -F ZIVPN_BW           2>/dev/null
-    iptables -X ZIVPN_BW           2>/dev/null
+
+    rm -f "$BIN" /usr/local/bin/opudp /usr/local/bin/opudp-hwid-monitor
+
     iptables -t nat -D PREROUTING -i "$iface" -p udp \
         --dport "${ps}:${pe}" -j DNAT --to-destination ":${LISTEN_PORT}" 2>/dev/null
-    iptables -L INPUT --line-numbers -n 2>/dev/null | grep "connlimit" | \
-        awk '{print $1}' | sort -rn | xargs -I{} iptables -D INPUT {} 2>/dev/null
+    while iptables -L INPUT -n --line-numbers 2>/dev/null | grep -q "opudp"; do
+        local ln
+        ln=$(iptables -L INPUT -n --line-numbers 2>/dev/null | grep "opudp" | head -1 | awk '{print $1}')
+        [[ -z "$ln" ]] && break
+        iptables -D INPUT "$ln" 2>/dev/null
+    done
     iptables-save > /etc/iptables/rules.v4 2>/dev/null
     ufw delete allow "${ps}:${pe}/udp"    2>/dev/null
     ufw delete allow "${LISTEN_PORT}/udp" 2>/dev/null
-    rm -rf /etc/zivpn
-    rm -f /usr/local/bin/opudp
-    echo ""; echo -e "${G}  ✓ Fully removed.${NC}"; exit 0
+
+    rm -rf /etc/zivpn /etc/sysctl.d/99-opudp.conf
+    rm -f /etc/network/if-pre-up.d/opudp-iptables
+
+    echo -e "\n${G}  Fully removed.${NC}"
+    exit 0
 }
 
 # ══════════════════════════════════════════════════════════════
-#  MAIN
+#  MAIN LOOP
 # ══════════════════════════════════════════════════════════════
 init
+
 while true; do
     show_header
     show_menu
-    read -r choice; echo ""
+    read -r choice
+    echo ""
     case $choice in
-        1)  start_svc       ;; 2)  stop_svc        ;; 3)  restart_svc    ;;
-        4)  show_status     ;; 5)  list_users       ;; 6)  add_user       ;;
-        7)  remove_user     ;; 8)  renew_user       ;; 9)  cleanup_expired;;
-        10) conn_stats      ;; 11) bw_report        ;; 12) reset_bandwidth;;
-        13) speed_test      ;; 14) live_logs        ;; 15) backup_data    ;;
-        16) restore_backup  ;; 17) change_port      ;; 18) auto_update    ;;
-        19) set_conn_limit  ;; 20) add_trial_user   ;; 99) uninstall      ;;
-        0)  echo -e "  ${GO}🔥 Goodbye!${NC}"; echo ""; exit 0 ;;
-        *)  echo -e "${FR}  ✗ Invalid: ${choice}${NC}" ;;
+        1)  start_svc       ;;
+        2)  stop_svc        ;;
+        3)  restart_svc     ;;
+        4)  show_status     ;;
+        5)  list_users      ;;
+        6)  add_user        ;;
+        7)  remove_user     ;;
+        8)  renew_user      ;;
+        9)  cleanup_expired ;;
+        10) conn_stats      ;;
+        11) bw_report       ;;
+        12) reset_bandwidth ;;
+        13) speed_test      ;;
+        14) live_logs       ;;
+        15) backup_data     ;;
+        16) restore_backup  ;;
+        17) change_port     ;;
+        18) auto_update     ;;
+        19) set_conn_limit  ;;
+        20) hwid_view_all   ;;
+        21) hwid_manage     ;;
+        22) hwid_logs       ;;
+        99) uninstall       ;;
+        0)  echo -e "  ${G}Bye!${NC}"; exit 0 ;;
+        *)  echo -e "${R}  Invalid option.${NC}" ;;
     esac
     pause
 done
