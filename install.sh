@@ -49,6 +49,27 @@ apt_install() {
         "$@" 2>/dev/null
 }
 
+# Download helper — uses wget if available, falls back to curl
+download() {
+    local url="$1" dest="$2"
+    if command -v wget &>/dev/null; then
+        wget --timeout=60 --tries=3 -q "$url" -O "$dest"
+    elif command -v curl &>/dev/null; then
+        curl -fsSL --connect-timeout 60 --retry 3 "$url" -o "$dest"
+    else
+        fail "Neither wget nor curl found. Cannot download files."
+        exit 1
+    fi
+}
+
+# ── BOOTSTRAP — install curl + wget immediately before anything else ──
+# This runs silently before the banner so fresh Debian systems work
+apt-get update -y -q 2>/dev/null
+apt-get install -y -q \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold" \
+    curl wget ca-certificates 2>/dev/null
+
 # ══════════════════════════════════════════════════════════════
 #  BANNER
 # ══════════════════════════════════════════════════════════════
@@ -175,14 +196,21 @@ step 4 "Downloading ZIVPN binary..."
 
 rm -f /usr/local/bin/zivpn 2>/dev/null
 
-if wget --timeout=60 --tries=3 -q --show-progress \
-        "$ZIVPN_BIN_URL" -O /usr/local/bin/zivpn; then
+if download "$ZIVPN_BIN_URL" /usr/local/bin/zivpn; then
     chmod +x /usr/local/bin/zivpn
     ok "ZIVPN binary downloaded and made executable"
 else
     fail "Failed to download ZIVPN binary."
     exit 1
 fi
+
+
+
+
+
+
+
+
 
 # ══════════════════════════════════════════════════════════════
 #  STEP 5 — DIRECTORIES & DATA FILES
@@ -389,14 +417,21 @@ fi
 # ══════════════════════════════════════════════════════════════
 step 10 "Installing OPUDP management panel..."
 
-if wget --timeout=60 --tries=3 -q \
-        "$PANEL_URL" -O /usr/local/bin/opudp; then
+if download "$PANEL_URL" /usr/local/bin/opudp; then
     chmod +x /usr/local/bin/opudp
     ok "OPUDP panel installed → run: opudp"
 else
     fail "Could not download OPUDP panel from GitHub."
     exit 1
 fi
+
+
+
+
+
+
+
+
 
 # ── Cleanup ───────────────────────────────────────────────────
 rm -f i.sh 2>/dev/null
@@ -428,9 +463,9 @@ echo -e "${C}║${NC}    UDP Server   →  ${Y}${SERVER_IP}${NC}"
 echo -e "${C}║${NC}    UDP Password →  ${Y}(password you set in opudp)${NC}"
 echo -e "${C}╠══════════════════════════════════════════════════════════════╣${NC}"
 echo -e "${C}║${NC}  Share this install command:${NC}"
-echo -e "${C}║${NC}  ${Y}wget -O i.sh https://raw.githubusercontent.com/         ${NC}"
-echo -e "${C}║${NC}  ${Y}OfficialOnePesewa/udp-opudp/main/install.sh             ${NC}"
-echo -e "${C}║${NC}  ${Y}&& sudo chmod +x i.sh && sudo ./i.sh                    ${NC}"
+echo -e "${C}║${NC}  ${Y}curl -o i.sh https://raw.githubusercontent.com/          ${NC}"
+echo -e "${C}║${NC}  ${Y}OfficialOnePesewa/udp-opudp/main/install.sh              ${NC}"
+echo -e "${C}║${NC}  ${Y}&& chmod +x i.sh && bash i.sh                              ${NC}"
 echo -e "${C}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  ${W}Service Status:${NC}"
