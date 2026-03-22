@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+# ============================================================
+#  OPUDP Auth Daemon — HWID Enforcement Server
+#  Author  : OfficialOnePesewa
+#  File    : /usr/local/bin/opudp-authd
+#  Port    : 127.0.0.1:7777  (only accessible locally)
+#  Version : 1.0.0
+# ============================================================
+#
+#  HOW IT WORKS:
+#  ─────────────────────────────────────────────────────────
+#  ZIVPN is configured with "mode": "external" auth.
+#  On every connection attempt, ZIVPN POSTs to this server:
+#    { "addr": "1.2.3.4:port", "payload": "password|HWID" }
+#
+#  This server:
+#   1. Splits payload → password + HWID
+#   2. Looks up password in users.db
+#   3. Checks: account valid? not expired? HWID matches?
+#   4. Returns { "ok": true/false, "id": "username" }
+#
+#  CLIENT MUST ENTER IN ZIVPN APP:
+#    password|HWID   ← separated by pipe character |
+#  Example:
+#    abc123|a1b2c3d4e5f6a1b2
+#
+#  HWID SEPARATOR: |  (pipe)
+#  If no | is present → connection denied (no HWID given)
+#  If stored HWID is "unbound" → allow any HWID (no restriction)
+# ============================================================
+
+import json
+import os
+import sys
+import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from datetime import date
+
+USERS_DB   = "/etc/zivpn/users.db"
+CONN_LOG   = "/etc/zivpn/connections.log"
+AUTH_LOG   = "/etc/zivpn/auth.log"
+HWID_SEP   = "|"
+LISTEN_IP  = "127.0.0.1"
+LISTEN_PORT = 7777
+
+# ── Load users.db into memory ─────────────────────────────────
+def load_users():
+    """
+    Returns dict keyed by password:
+      { "pass123": { username, expiry, hwid, max_conn } }
+    """
+    users = {}
+    try:
+        with open(USERS_DB, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split(':')
+                # Pad missing fields up to 6
+                while len(parts) < 6:
+                    parts.append('')
+                username  = parts[0]
+                password  = parts[1]
+                expiry    = parts[2] if parts[2] else 'never'
+                bw        = parts[3]
+                max_conn  = parts[4] if parts[4] else '0'
+                hwid      = parts[5] if parts[5] else 'unbound'
+                if not username or not password:
+                    continue
+                # If same password appears twice (shouldn't), last wins
+                users[password] = {
+                    'username': username,
+                    'expiry':   expiry,
+                    'hwid':     hwid,
+                    'max_conn': max_conn,
+                }
+    except FileNotFoundError:
+        log_auth("WARN", "users.db not found at " + USERS_DB)
+    except Exception as ex:
+        log_auth("ERROR", "Failed reading users.db: " + str(ex))
+    return users
+
+
+def is_expired(expiry_str):
+    if not expiry_str or expiry_str.lower() == 'never':
+        return False
+    try:
+        return date.today() > date.fromisoformat(expiry_str)
+    except ValueError:
+        return False
+
+
+# ── Logging ───────────────────────────────────────────────────
+def log_auth(level, message):
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    entry = f"[{ts}] [{level}] {message}\n"
+    try:
+        with open(AUTH_LOG, 'a') as f:
+            f.write(entry)
+    except Exception:
+        pass
+    # Also print to stdout so journalctl sees it
+    print(entry, end='', flush=True)
+
+
+def log_conn(status, username, ip, client_hwid, reason):
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    hwid_display = (client_hwid[:24] + '...') if len(client_hwid) > 24 else client_hwid
+    entry = f"[{ts}] {status:<6} user={username:<18} ip={ip:<22} hwid={hwid_display:<26} reason={reason}\n"
+    try:
+        with open(CONN_LOG, 'a') as f:
+            f.write(entry)
+    except Exception:
+        pass
+
+
+# ── HTTP Handler ──────────────────────────────────────────────
+class AuthHandler(BaseHTTPRequestHandler):
+
+    def log_message(self, fmt, *args):
+        # Suppress default HTTP request log noise
+        pass
+
+    def do_POST(self):
+        if self.path != '/auth':
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        # Read body
+        try:
+            length  = int(self.headers.get('Content-Length', 0))
+            raw     = self.rfile.read(length)
+            data    = json.loads(raw)
+        except Exception as ex:
+            log_auth("ERROR", f"Bad request body: {ex}")
+            self._respond({"ok": False, "id": "parse_error"})
+            return
+
+        payload    = data.get('payload', '')
+        addr       = data.get('addr', 'unknown')
+        result     = self._validate(payload, addr)
+
+        self._respond(result)
+
+    def _validate(self, payload, addr):
+        # ── 1. Split password | HWID ──────────────────────────
+        if HWID_SEP not in payload:
+            # Client sent only a password with no HWID separator
+            # Treat as unregistered device — deny
+            log_conn("DENY", "unknown", addr, "none", "no_hwid_separator")
+            log_auth("DENY", f"ip={addr} | No HWID separator in payload. Client must use password{HWID_SEP}HWID format.")
+            return {"ok": False, "id": "no_hwid"}
+
+        password, client_hwid = payload.split(HWID_SEP, 1)
+        client_hwid = client_hwid.strip()
+
+        # ── 2. Load DB fresh on every request ─────────────────
+        #  (so opudp changes take effect immediately, no restart needed)
+        users = load_users()
+
+        # ── 3. Look up password ───────────────────────────────
+        if password not in users:
+            log_conn("DENY", "unknown", addr, client_hwid, "wrong_password")
+            log_auth("DENY", f"ip={addr} hwid={client_hwid[:20]} | Password not found.")
+            return {"ok": False, "id": "wrong_password"}
+
+        user         = users[password]
+        username     = user['username']
+        stored_hwid  = user['hwid']
+        expiry       = user['expiry']
+
+        # ── 4. Check expiry ───────────────────────────────────
+        if is_expired(expiry):
+            log_conn("DENY", username, addr, client_hwid, "account_expired")
+            log_auth("DENY", f"user={username} ip={addr} | Account expired on {expiry}.")
+            return {"ok": False, "id": "expired"}
+
+        # ── 5. HWID check ─────────────────────────────────────
+        if stored_hwid == 'unbound':
+            # No HWID restriction set for this entry — allow any device
+            log_conn("ALLOW", username, addr, client_hwid, "hwid_unbound")
+            log_auth("ALLOW", f"user={username} ip={addr} hwid={client_hwid[:20]} | Unbound entry — no HWID restriction.")
+            return {"ok": True, "id": username}
+
+        if not client_hwid:
+            # HWID restriction exists but client sent empty HWID
+            log_conn("DENY", username, addr, "empty", "empty_hwid")
+            log_auth("DENY", f"user={username} ip={addr} | HWID restriction active but client sent empty HWID.")
+            return {"ok": False, "id": "empty_hwid"}
+
+        if client_hwid == stored_hwid:
+            # ✅ Correct password + correct HWID
+            log_conn("ALLOW", username, addr, client_hwid, "hwid_match")
+            log_auth("ALLOW", f"user={username} ip={addr} hwid={client_hwid[:20]} | HWID verified.")
+            return {"ok": True, "id": username}
+        else:
+            # ❌ Correct password but WRONG HWID — unregistered device
+            log_conn("DENY", username, addr, client_hwid, "hwid_mismatch")
+            log_auth("DENY",
+                f"user={username} ip={addr} | "
+                f"HWID mismatch. "
+                f"Expected={stored_hwid[:20]} "
+                f"Got={client_hwid[:20]}")
+            return {"ok": False, "id": "hwid_mismatch"}
+
+    def _respond(self, result_dict):
+        body = json.dumps(result_dict).encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+# ── Entry point ───────────────────────────────────────────────
+if __name__ == '__main__':
+    log_auth("INFO", f"OPUDP Auth Daemon starting on {LISTEN_IP}:{LISTEN_PORT}")
+    log_auth("INFO", f"Reading users from: {USERS_DB}")
+    log_auth("INFO", f"HWID separator: '{HWID_SEP}'  (client must enter password{HWID_SEP}HWID)")
+
+    try:
+        server = HTTPServer((LISTEN_IP, LISTEN_PORT), AuthHandler)
+        log_auth("INFO", "Auth daemon ready. Listening for ZIVPN auth requests...")
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log_auth("INFO", "Auth daemon stopped.")
+        sys.exit(0)
+    except Exception as ex:
+        log_auth("CRITICAL", f"Failed to start: {ex}")
+        sys.exit(1)
