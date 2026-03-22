@@ -4,32 +4,25 @@
 #  Author  : OfficialOnePesewa
 #  GitHub  : https://github.com/OfficialOnePesewa/udp-opudp
 #  Command : opudp
-#  Version : 4.0.0
+#  Version : 4.2.0
 # ============================================================
 #
-#  CREDENTIAL GUIDE:
+#  MULTI-HWID SYSTEM:
 #  ─────────────────────────────────────────────────────────
-#  USERNAME  → label only (panel management)
-#  PASSWORD  → what user enters in ZIVPN Pro app
-#  MAX CONN  → max simultaneous device connections (0=unlimited)
-#  HWID      → device fingerprint — locks password to ONE device
+#  Each user can have 1 or more HWIDs registered.
+#  Only devices whose HWID is in the user's HWID list
+#  can connect. Any other device is BLOCKED.
 #
-#  HWID SYSTEM:
-#  ─────────────────────────────────────────────────────────
-#  When HWID is set for a user, ONLY that specific device IP
-#  can connect using that password. Anyone who copies the
-#  password to a different device/IP will be BLOCKED.
+#  Customer: ZIVPN Pro → ☰ Menu → Tool → HWID → tap to copy
+#  Example:  433E11A0A365E80B21DB209174B8DF87
 #
-#  HOW IT WORKS:
-#    1. User connects for the first time → their IP is captured
-#       as their HWID (device fingerprint) automatically
-#    2. OR admin manually sets the HWID from user's device info
-#    3. iptables rules enforce: only that IP can use that account
-#    4. Admin can reset HWID to allow a device change
+#  Multiple HWIDs are stored comma-separated in field 6:
+#  HWID1,HWID2,HWID3
 #
 #  users.db format (7 fields):
-#  username:password:expiry:bandwidth:max_conn:hwid:hwid_locked
-#  hwid_locked → 0=not yet captured, 1=locked to device
+#  username:password:expiry:bandwidth:max_conn:hwids:hwid_locked
+#  hwids       → comma-separated 32-char hex codes (or "none")
+#  hwid_locked → 0=not set, 1=locked (has at least 1 HWID)
 # ============================================================
 
 CONFIG="/etc/zivpn/config.json"
@@ -40,11 +33,10 @@ BACKUP_DIR="/etc/zivpn/backups"
 SESSIONS_DIR="/etc/zivpn/sessions"
 HWID_LOG="/etc/zivpn/hwid.log"
 CONN_LOG="/etc/zivpn/connections.log"
-HWID_RULES="/etc/zivpn/hwid_rules.sh"
 SVC="zivpn"
 BIN="/usr/local/bin/zivpn"
 LISTEN_PORT="5667"
-PANEL_VERSION="4.0.0"
+PANEL_VERSION="4.2.0"
 GITHUB_RAW="https://raw.githubusercontent.com/OfficialOnePesewa/udp-opudp/main"
 
 # ── Colours ──────────────────────────────────────────────────
@@ -58,31 +50,25 @@ C='\033[0;36m'; W='\033[1;37m'; M='\033[0;35m'; NC='\033[0m'
 # ══════════════════════════════════════════════════════════════
 init() {
     mkdir -p /etc/zivpn "$BACKUP_DIR" "$SESSIONS_DIR"
-    [[ ! -f "$USERS_DB" ]] && touch "$USERS_DB"
-    [[ ! -f "$CODES_DB" ]] && touch "$CODES_DB"
+    [[ ! -f "$USERS_DB"  ]] && touch "$USERS_DB"
+    [[ ! -f "$CODES_DB"  ]] && touch "$CODES_DB"
     [[ ! -f "$PORT_FILE" ]] && echo "6000:19999" > "$PORT_FILE"
     [[ ! -f "$CONN_LOG"  ]] && touch "$CONN_LOG"
     [[ ! -f "$HWID_LOG"  ]] && touch "$HWID_LOG"
     migrate_db
-    # Start HWID monitor in background if not already running
     start_hwid_monitor
 }
 
-# ── Migrate DB to 7-field format ─────────────────────────────
+# ── Migrate DB → ensure 7-field format ───────────────────────
 migrate_db() {
-    local tmp changed=0
-    tmp=$(mktemp)
-    while IFS=':' read -r u p e bw mc hwid hlocked; do
+    [[ ! -s "$USERS_DB" ]] && return
+    local tmp; tmp=$(mktemp)
+    while IFS=':' read -r u p e bw mc hwid hl; do
         [[ -z "$u" ]] && continue
-        # Add missing fields progressively
-        [[ -z "$mc"      ]] && mc="0"
-        [[ -z "$hwid"    ]] && hwid="none"
-        [[ -z "$hlocked" ]] && hlocked="0"
-        if [[ "$mc" == "0" && "$hwid" == "none" ]] || \
-           [[ -z $(echo "$u:$p:$e:$bw:$mc:$hwid:$hlocked" | cut -d: -f7) ]]; then
-            changed=1
-        fi
-        echo "${u}:${p}:${e}:${bw}:${mc}:${hwid}:${hlocked}" >> "$tmp"
+        [[ -z "$mc"   ]] && mc="0"
+        [[ -z "$hwid" ]] && hwid="none"
+        [[ -z "$hl"   ]] && hl="0"
+        echo "${u}:${p}:${e}:${bw}:${mc}:${hwid}:${hl}" >> "$tmp"
     done < "$USERS_DB"
     mv "$tmp" "$USERS_DB"
 }
@@ -132,6 +118,50 @@ get_connected_ips() {
         awk '{print $5}' | cut -d: -f1 | sort -u
 }
 
+is_valid_hwid() {
+    local h="${1^^}"
+    [[ "$h" =~ ^[0-9A-F]{32}$ ]]
+}
+
+format_hwid() {
+    local h="${1^^}"
+    echo "${h:0:8}-${h:8:8}-${h:16:8}-${h:24:8}"
+}
+
+count_hwids() {
+    local hwid_field="$1"
+    [[ "$hwid_field" == "none" || -z "$hwid_field" ]] && echo 0 && return
+    echo "$hwid_field" | tr ',' '\n' | grep -c .
+}
+
+hwid_in_list() {
+    local needle="${1^^}"
+    local hwid_field="$2"
+    [[ "$hwid_field" == "none" || -z "$hwid_field" ]] && return 1
+    echo "$hwid_field" | tr ',' '\n' | while read -r h; do
+        [[ "${h^^}" == "$needle" ]] && exit 0
+    done
+    return $?
+}
+
+add_hwid_to_list() {
+    local new_hwid="${1^^}"
+    local current="$2"
+    if [[ "$current" == "none" || -z "$current" ]]; then
+        echo "$new_hwid"
+    else
+        echo "${current},${new_hwid}"
+    fi
+}
+
+remove_hwid_from_list() {
+    local target="${1^^}"
+    local current="$2"
+    local result
+    result=$(echo "$current" | tr ',' '\n' | grep -vi "^${target}$" | tr '\n' ',' | sed 's/,$//')
+    [[ -z "$result" ]] && echo "none" || echo "$result"
+}
+
 # ══════════════════════════════════════════════════════════════
 #  CONFIG REBUILD
 # ══════════════════════════════════════════════════════════════
@@ -161,139 +191,83 @@ EOF
 }
 
 # ══════════════════════════════════════════════════════════════
-#  HWID ENFORCEMENT ENGINE
+#  CONNECTION LIMIT RULES
 # ══════════════════════════════════════════════════════════════
-
-# Apply all iptables rules: connlimit + HWID source IP filtering
-apply_all_rules() {
-    local iface
-    iface=$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}')
-
-    # ── Clear old OPUDP INPUT rules ──────────────────────────
-    # Remove rules tagged with comment "opudp-hwid" or "opudp-conn"
-    while iptables -L INPUT -n --line-numbers 2>/dev/null | \
-            grep -qE "opudp-(hwid|conn)"; do
-        local linenum
-        linenum=$(iptables -L INPUT -n --line-numbers 2>/dev/null | \
-                  grep -E "opudp-(hwid|conn)" | head -1 | awk '{print $1}')
-        [[ -z "$linenum" ]] && break
-        iptables -D INPUT "$linenum" 2>/dev/null
+apply_conn_rules() {
+    while iptables -L INPUT -n --line-numbers 2>/dev/null | grep -q "opudp-conn"; do
+        local ln
+        ln=$(iptables -L INPUT -n --line-numbers 2>/dev/null | \
+             grep "opudp-conn" | head -1 | awk '{print $1}')
+        [[ -z "$ln" ]] && break
+        iptables -D INPUT "$ln" 2>/dev/null
     done
-
-    # ── Rebuild rules per user ────────────────────────────────
     while IFS=':' read -r u p e bw mc hwid hl; do
         [[ -z "$u" ]] && continue
         is_expired "$e" && continue
-
-        # connlimit rule
         if [[ "$mc" =~ ^[0-9]+$ && "$mc" -gt 0 ]]; then
             iptables -A INPUT -p udp --dport "$LISTEN_PORT" \
                 -m connlimit --connlimit-above "$mc" --connlimit-mask 0 \
                 -m comment --comment "opudp-conn-${u}" \
                 -j DROP 2>/dev/null
         fi
-
-        # HWID rule — if locked and has a real IP
-        if [[ "$hl" == "1" && "$hwid" != "none" && -n "$hwid" ]]; then
-            # Allow only the registered HWID IP to reach the listen port
-            # Block all OTHER IPs that would use this user (we track by IP)
-            # We do this by using recent module to flag the registered IP
-            # Simpler: allow registered IP, mark unregistered attempts in log
-            iptables -A INPUT -p udp --dport "$LISTEN_PORT" \
-                ! -s "$hwid" \
-                -m comment --comment "opudp-hwid-${u}" \
-                -j LOG --log-prefix "OPUDP-HWID-BLOCK: " 2>/dev/null
-        fi
-
     done < "$USERS_DB"
-
-    # Save persisted rules
-    mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4 2>/dev/null
-
-    # Also write an HWID rules script for reference/debug
-    generate_hwid_rules_script
-}
-
-# Write a readable script showing all active HWID rules
-generate_hwid_rules_script() {
-    cat > "$HWID_RULES" << 'HEOF'
-#!/bin/bash
-# OPUDP HWID Rules — auto-generated, do not edit manually
-# Run: bash /etc/zivpn/hwid_rules.sh  to reapply after reboot
-HEOF
-    while IFS=':' read -r u p e bw mc hwid hl; do
-        [[ -z "$u" || "$hl" != "1" || "$hwid" == "none" ]] && continue
-        echo "# User: ${u} — locked to IP: ${hwid}" >> "$HWID_RULES"
-        echo "iptables -A INPUT -p udp --dport ${LISTEN_PORT} ! -s ${hwid} -m comment --comment \"opudp-hwid-${u}\" -j LOG --log-prefix \"OPUDP-HWID-BLOCK: \"" >> "$HWID_RULES"
-    done < "$USERS_DB"
-    chmod +x "$HWID_RULES"
 }
 
 # ══════════════════════════════════════════════════════════════
 #  HWID MONITOR — background daemon
-#  Watches ZIVPN journal logs for new connections.
-#  On first connect: auto-captures the connecting IP as HWID.
-#  On subsequent connects: checks IP matches registered HWID.
 # ══════════════════════════════════════════════════════════════
 start_hwid_monitor() {
-    # Check if monitor already running
     if pgrep -f "opudp-hwid-monitor" &>/dev/null; then
         return
     fi
 
-    # Write the monitor script
     cat > /usr/local/bin/opudp-hwid-monitor << 'MONITOR'
 #!/bin/bash
-# OPUDP HWID Monitor — runs as background daemon
+# OPUDP HWID Monitor v4.2 — Multi-HWID enforcement
 USERS_DB="/etc/zivpn/users.db"
 HWID_LOG="/etc/zivpn/hwid.log"
 LISTEN_PORT="5667"
 
-log_hwid() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$HWID_LOG"; }
+log_h() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$HWID_LOG"; }
+log_h "HWID Monitor started (PID $$) — Multi-HWID mode"
 
-log_hwid "HWID Monitor started (PID $$)"
-
-# Watch live ZIVPN journal for connection events
 journalctl -u zivpn -f --no-pager -o cat 2>/dev/null | while read -r line; do
 
-    # ZIVPN logs connecting client IP in various formats
-    # Extract IP from log line — handles both IPv4 and common log formats
+    conn_hwid=""
     conn_ip=""
-    if echo "$line" | grep -qiE "client|connect|auth|login"; then
-        conn_ip=$(echo "$line" | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | head -1)
-    fi
 
-    [[ -z "$conn_ip" ]] && continue
-    # Skip localhost/private ranges if needed — keep real IPs
+    conn_hwid=$(echo "$line" | grep -oE '[0-9A-Fa-f]{32}' | head -1 | tr '[:lower:]' '[:upper:]')
+    conn_ip=$(echo "$line" | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | head -1)
+
+    [[ -z "$conn_hwid" && -z "$conn_ip" ]] && continue
     [[ "$conn_ip" =~ ^(127\.|0\.) ]] && continue
 
-    # Check each user — find whose password matches this connection
-    # We do this by checking if this IP is already registered
-    while IFS=':' read -r u p e bw mc hwid hl; do
+    while IFS=':' read -r u p e bw mc hwids hl; do
         [[ -z "$u" ]] && continue
+        if [[ "$e" != "never" ]]; then
+            exp_s=$(date -d "$e" +%s 2>/dev/null)
+            now_s=$(date +%s)
+            [[ "$exp_s" -lt "$now_s" ]] && continue
+        fi
 
-        # Skip expired users
-        exp_check=$(date -d "$e" +%s 2>/dev/null)
-        now_check=$(date +%s)
-        [[ "$e" != "never" && "$exp_check" -lt "$now_check" ]] && continue
+        [[ "$hl" != "1" || "$hwids" == "none" || -z "$hwids" ]] && continue
 
-        if [[ "$hl" == "0" || "$hwid" == "none" ]]; then
-            # First time connection — auto-capture this IP as HWID
-            log_hwid "AUTO-CAPTURE | user=${u} | hwid_ip=${conn_ip} | status=first_connect"
-            # Update users.db — set hwid and lock it
-            sed -i "s|^${u}:${p}:${e}:${bw}:${mc}:.*$|${u}:${p}:${e}:${bw}:${mc}:${conn_ip}:1|" \
-                "$USERS_DB" 2>/dev/null
-            log_hwid "HWID LOCKED  | user=${u} | device_ip=${conn_ip}"
+        if [[ -n "$conn_hwid" ]]; then
+            matched=false
+            IFS=',' read -ra hwid_arr <<< "$hwids"
+            for registered in "${hwid_arr[@]}"; do
+                if [[ "${conn_hwid^^}" == "${registered^^}" ]]; then
+                    matched=true
+                    break
+                fi
+            done
 
-        elif [[ "$hl" == "1" && "$hwid" != "none" ]]; then
-            # HWID already locked — check if IP matches
-            if [[ "$conn_ip" != "$hwid" ]]; then
-                log_hwid "HWID BLOCKED | user=${u} | registered=${hwid} | attempted=${conn_ip}"
-                # Kill any established connection from this foreign IP
-                ss -K dst "$conn_ip" dport = "$LISTEN_PORT" 2>/dev/null
+            if [[ "$matched" == "false" ]]; then
+                log_h "HWID BLOCKED | user=${u} | registered_hwids=${hwids} | attempted=${conn_hwid} | ip=${conn_ip}"
+                [[ -n "$conn_ip" ]] && ss -K dst "$conn_ip" dport = "$LISTEN_PORT" 2>/dev/null
             else
-                log_hwid "HWID OK      | user=${u} | ip=${conn_ip}"
+                log_h "HWID OK      | user=${u} | hwid=${conn_hwid} | ip=${conn_ip}"
             fi
         fi
 
@@ -304,12 +278,11 @@ MONITOR
 
     chmod +x /usr/local/bin/opudp-hwid-monitor
 
-    # Create systemd service for the monitor
     cat > /etc/systemd/system/opudp-hwid-monitor.service << 'SVC'
 [Unit]
-Description=OPUDP HWID Connection Monitor
+Description=OPUDP HWID Monitor (Multi-HWID enforcement)
 After=zivpn.service
-Requires=zivpn.service
+Wants=zivpn.service
 
 [Service]
 Type=simple
@@ -335,28 +308,27 @@ SVC
 # ══════════════════════════════════════════════════════════════
 show_header() {
     clear
-    local svc_st mon_st users port ip live
+    local svc_st mon_st users port ip live hwid_locked
     svc_st=$(systemctl is-active "$SVC" 2>/dev/null)
     mon_st=$(systemctl is-active opudp-hwid-monitor 2>/dev/null)
     users=$(count_active)
     port=$(get_port)
     ip=$(get_ip)
     live=$(count_live_connections)
-
-    # Count HWID-locked users
-    local hwid_locked=0
+    hwid_locked=0
     while IFS=':' read -r u p e bw mc hwid hl; do
-        [[ "$hl" == "1" ]] && hwid_locked=$((hwid_locked+1))
+        [[ "$hl" == "1" && "$hwid" != "none" ]] && hwid_locked=$((hwid_locked+1))
     done < "$USERS_DB"
 
     echo -e "${C}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${C}║${W}       EXPIRY + BANDWIDTH  Ultimate Control Panel             ${C}║${NC}"
-    echo -e "${C}║${C}        User Expiry  •  Limits  •  Stats  •  HWID Lock        ${C}║${NC}"
+    echo -e "${C}║${C}    User Expiry  •  Limits  •  Stats  •  Multi-HWID Lock      ${C}║${NC}"
     echo -e "${C}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    local sc; [[ "$svc_st" == "active" ]] && sc=$G || sc=$R
-    local mc; [[ "$mon_st" == "active" ]] && mc=$G || mc=$R
-    echo -e "  ZIVPN    : ${sc}${svc_st}${NC}     HWID Monitor: ${mc}${mon_st}${NC}"
+    local sc mc_c
+    [[ "$svc_st" == "active" ]] && sc=$G || sc=$R
+    [[ "$mon_st" == "active" ]] && mc_c=$G || mc_c=$R
+    echo -e "  ZIVPN    : ${sc}${svc_st}${NC}     HWID Monitor: ${mc_c}${mon_st}${NC}"
     echo -e "  Users    : ${G}${users}${NC}  Live: ${G}${live}${NC}  HWID Locked: ${M}${hwid_locked}${NC}"
     echo -e "  IP       : ${C}${ip}${NC}   Ports: ${Y}${port}${NC}   v${PANEL_VERSION}"
     echo ""
@@ -374,9 +346,12 @@ show_menu() {
     echo -e "  ${G}6)${NC}  Add User                 ${G}17)${NC} Change Port Range"
     echo -e "  ${G}7)${NC}  Remove User              ${G}18)${NC} Auto-Update"
     echo -e "  ${G}8)${NC}  Renew/Extend User        ${G}19)${NC} Set Connection Limit"
-    echo -e "  ${G}9)${NC}  Cleanup Expired          ${M}20)${NC} HWID — View All"
-    echo -e "  ${G}10)${NC} Connection Stats         ${M}21)${NC} HWID — Set / Reset"
-    echo -e "  ${G}11)${NC} Bandwidth Report         ${M}22)${NC} HWID — Monitor Logs"
+    echo -e "  ${G}9)${NC}  Cleanup Expired          ${M}20)${NC} HWID — View All Users"
+    echo -e "  ${G}10)${NC} Connection Stats         ${M}21)${NC} HWID — Add Device"
+    echo -e "  ${G}11)${NC} Bandwidth Report         ${M}22)${NC} HWID — Remove Device"
+    echo -e "                               ${M}23)${NC} HWID — View User Devices"
+    echo -e "                               ${M}24)${NC} HWID — Clear All Devices"
+    echo -e "                               ${M}25)${NC} HWID — Monitor Logs"
     echo -e "  ${G}0)${NC}  Exit"
     echo ""
     echo -ne "${Y}Choose [0-99] ► ${NC}"
@@ -413,15 +388,15 @@ show_status() {
 }
 
 # ══════════════════════════════════════════════════════════════
-#  5) LIST USERS — shows HWID status
+#  5) LIST USERS
 # ══════════════════════════════════════════════════════════════
 list_users() {
     echo -e "${C}═══ User List ═══════════════════════════════════════════════${NC}"
     if [[ ! -s "$USERS_DB" ]]; then
         echo -e "  ${Y}No users found. Use option 6 to add one.${NC}"; return
     fi
-    printf "\n  %-16s %-18s %-11s %-5s %-5s %-17s %s\n" \
-        "USERNAME" "PASSWORD" "EXPIRY" "DAYS" "CONN" "HWID / DEVICE IP" "STATUS"
+    printf "\n  %-14s %-18s %-11s %-5s %-5s %-10s %s\n" \
+        "USERNAME" "PASSWORD" "EXPIRY" "DAYS" "CONN" "HWID SLOTS" "STATUS"
     divider
     while IFS=':' read -r u p e bw mc hwid hl; do
         [[ -z "$u" ]] && continue
@@ -429,16 +404,14 @@ list_users() {
         [[ -z "$hwid" ]] && hwid="none"
         [[ -z "$hl"   ]] && hl="0"
 
-        local dl st conn_d hwid_d
+        local dl st conn_d hwid_d n_hwids
         [[ "$mc" -eq 0 ]] && conn_d="∞" || conn_d="$mc"
+        n_hwids=$(count_hwids "$hwid")
 
-        # HWID display
         if [[ "$hl" == "1" && "$hwid" != "none" ]]; then
-            hwid_d="${M}${hwid}${NC}"
-        elif [[ "$hl" == "0" ]]; then
-            hwid_d="${Y}awaiting 1st connect${NC}"
+            hwid_d="${M}${n_hwids} device(s)${NC}"
         else
-            hwid_d="${R}none${NC}"
+            hwid_d="${Y}not set${NC}"
         fi
 
         if is_expired "$e"; then
@@ -449,32 +422,29 @@ list_users() {
                 && st="${Y}EXPIRING${NC}" || st="${G}ACTIVE${NC}"
         fi
 
-        printf "  %-16s %-18s %-11s %-5s %-5s " "$u" "$p" "$e" "$dl" "$conn_d"
-        echo -e "${hwid_d}  ${st}"
+        printf "  %-14s %-18s %-11s %-5s %-5s " "$u" "$p" "$e" "$dl" "$conn_d"
+        echo -e "${hwid_d}   ${st}"
     done < "$USERS_DB"
     echo ""
 }
 
 # ══════════════════════════════════════════════════════════════
-#  6) ADD USER — with HWID option
+#  6) ADD USER
 # ══════════════════════════════════════════════════════════════
 add_user() {
     echo -e "${C}═══ Add New User ════════════════════════════════════════════${NC}"
     echo ""
 
-    # Username
     read -rp "  Username: " username
     username=$(echo "$username" | tr -d ' ')
     [[ -z "$username" ]] && echo -e "${R}  Username cannot be empty.${NC}" && return
     grep -q "^${username}:" "$USERS_DB" 2>/dev/null \
         && echo -e "${R}  User '${username}' already exists!${NC}" && return
 
-    # Password
     read -rp "  Password: " password
     password=$(echo "$password" | tr -d ' ')
     [[ -z "$password" ]] && echo -e "${R}  Password cannot be empty.${NC}" && return
 
-    # Expiry
     echo ""
     echo -e "  ${W}Expiry:${NC}"
     echo "    1) 1 month   2) 3 months  3) 6 months"
@@ -492,7 +462,6 @@ add_user() {
         *) echo -e "${R}  Invalid.${NC}"; return ;;
     esac
 
-    # Connection limit
     echo ""
     echo -e "  ${W}Connection Limit:${NC}"
     echo "    1) 1 device  2) 2 devices  3) 3 devices"
@@ -506,91 +475,83 @@ add_user() {
         *) max_conn=0 ;;
     esac
 
-    # ── HWID Setting ──────────────────────────────────────────
     echo ""
-    echo -e "  ${M}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "  ${M}║             HWID — Device Lock Setting               ║${NC}"
-    echo -e "  ${M}╠══════════════════════════════════════════════════════╣${NC}"
-    echo -e "  ${M}║${NC}  HWID locks this password to ONE specific device.     ${M}║${NC}"
-    echo -e "  ${M}║${NC}  If someone copies this password to another device,   ${M}║${NC}"
-    echo -e "  ${M}║${NC}  their connection will be BLOCKED automatically.      ${M}║${NC}"
-    echo -e "  ${M}╚══════════════════════════════════════════════════════╝${NC}"
+    echo -e "${M}  ╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${M}  ║           HWID — Device Lock (Multi-Device)             ║${NC}"
+    echo -e "${M}  ╠══════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${M}  ║${NC}  Customer: ${W}ZIVPN Pro → ☰ Menu → Tool → HWID → Copy${NC}   ${M}║${NC}"
+    echo -e "${M}  ║${NC}  Example : ${Y}433E11A0A365E80B21DB209174B8DF87${NC}              ${M}║${NC}"
+    echo -e "${M}  ║${NC}  You can add multiple HWIDs (one per device).         ${M}║${NC}"
+    echo -e "${M}  ╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "  ${W}HWID Options:${NC}"
-    echo "    1) Auto-capture on first connect (recommended)"
-    echo "       → User connects once, their device IP is locked automatically"
-    echo "    2) Set manually now"
-    echo "       → Enter the user's device IP address right now"
-    echo "    3) No HWID lock (not recommended)"
-    echo "       → Anyone with the password can connect from any device"
+    echo -e "  ${W}How many devices does this user have?${NC}"
+    echo "    1) 1 device   2) 2 devices  3) 3 devices"
+    echo "    4) 4 devices  5) 5 devices  6) Skip (add later via option 21)"
     echo ""
-    read -rp "  Choose [1-3]: " hc
+    read -rp "  Choose [1-6]: " device_count_choice
 
-    local hwid="none"
+    local hwid_list="none"
     local hwid_locked="0"
-    local hwid_note=""
+    local num_devices=0
 
-    case $hc in
-        1)
-            hwid="none"
-            hwid_locked="0"
-            hwid_note="Auto-capture on first connect"
-            ;;
-        2)
-            read -rp "  Enter device IP (e.g. 197.251.240.5): " hwid_input
-            hwid_input=$(echo "$hwid_input" | tr -d ' ')
-            if [[ "$hwid_input" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-                hwid="$hwid_input"
-                hwid_locked="1"
-                hwid_note="Manually locked to ${hwid}"
-            else
-                echo -e "  ${Y}  Invalid IP — defaulting to auto-capture.${NC}"
-                hwid="none"
-                hwid_locked="0"
-                hwid_note="Auto-capture on first connect (fallback)"
-            fi
-            ;;
-        3)
-            hwid="none"
-            hwid_locked="0"
-            hwid_note="${R}No HWID lock${NC}"
-            ;;
-        *)
-            hwid="none"
-            hwid_locked="0"
-            hwid_note="Auto-capture on first connect (default)"
-            ;;
+    case $device_count_choice in
+        1) num_devices=1 ;; 2) num_devices=2 ;; 3) num_devices=3 ;;
+        4) num_devices=4 ;; 5) num_devices=5 ;; 6|*) num_devices=0 ;;
     esac
 
-    # Save to DB
-    echo "${username}:${password}:${expiry}:0:${max_conn}:${hwid}:${hwid_locked}" >> "$USERS_DB"
+    if [[ $num_devices -gt 0 ]]; then
+        echo ""
+        local collected=0
+        for (( i=1; i<=num_devices; i++ )); do
+            echo -e "  ${W}Device ${i} HWID:${NC}"
+            read -rp "  Paste HWID (32 chars): " h_input
+            h_input=$(echo "$h_input" | tr -d ' -' | tr '[:lower:]' '[:upper:]')
+            if is_valid_hwid "$h_input"; then
+                hwid_list=$(add_hwid_to_list "$h_input" "$hwid_list")
+                hwid_locked="1"
+                echo -e "  ${G}  ✓ Device ${i}: $(format_hwid "$h_input")${NC}"
+                collected=$((collected+1))
+            else
+                echo -e "  ${R}  ✗ Invalid HWID — skipped.${NC}"
+                echo -e "  ${Y}    Must be 32 hex characters. Add via option 21 later.${NC}"
+            fi
+        done
+        [[ $collected -eq 0 ]] && hwid_list="none" && hwid_locked="0"
+    else
+        echo -e "  ${Y}  HWID skipped — add device(s) later via option 21.${NC}"
+    fi
+
+    echo "${username}:${password}:${expiry}:0:${max_conn}:${hwid_list}:${hwid_locked}" >> "$USERS_DB"
     rebuild_config
-    apply_all_rules
+    apply_conn_rules
     systemctl restart "$SVC" 2>/dev/null
 
     local server_ip; server_ip=$(get_ip)
     local cl; [[ "$max_conn" -eq 0 ]] && cl="Unlimited" || cl="${max_conn} device(s)"
+    local n_hwids; n_hwids=$(count_hwids "$hwid_list")
 
     echo ""
-    echo -e "${G}  ✓ User '${username}' added!${NC}"
+    echo -e "${G}  ✓ User '${username}' created!${NC}"
     echo ""
-    echo -e "${C}  ╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${C}  ║${W}          ZIVPN App Configuration                   ${C}║${NC}"
-    echo -e "${C}  ╠══════════════════════════════════════════════════════╣${NC}"
+    echo -e "${C}  ╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${C}  ║${W}           ZIVPN App Configuration                     ${C}║${NC}"
+    echo -e "${C}  ╠══════════════════════════════════════════════════════════╣${NC}"
     echo -e "${C}  ║${NC}  UDP Server   :  ${Y}${server_ip}${NC}"
-    echo -e "${C}  ║${NC}  UDP Password :  ${Y}${password}${NC}  ${G}← enter in ZIVPN app${NC}"
+    echo -e "${C}  ║${NC}  UDP Password :  ${Y}${password}${NC}  ${G}← enter this in app${NC}"
     echo -e "${C}  ║${NC}  Expiry       :  ${Y}${expiry}${NC}"
-    echo -e "${C}  ║${NC}  Max Devices  :  ${Y}${cl}${NC}"
-    echo -e "${C}  ╠══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${C}  ║${W}          HWID Device Lock                          ${C}║${NC}"
-    echo -e "${C}  ╠══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${C}  ║${NC}  Mode   :  ${M}${hwid_note}${NC}"
-    if [[ "$hwid_locked" == "1" ]]; then
-        echo -e "${C}  ║${NC}  Status :  ${M}LOCKED to ${hwid}${NC}"
+    echo -e "${C}  ║${NC}  Max Conn     :  ${Y}${cl}${NC}"
+    echo -e "${C}  ╠══════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${C}  ║${W}           HWID Device Lock                            ${C}║${NC}"
+    echo -e "${C}  ╠══════════════════════════════════════════════════════════╣${NC}"
+    if [[ "$hwid_locked" == "1" && "$hwid_list" != "none" ]]; then
+        echo -e "${C}  ║${NC}  Status   :  ${M}LOCKED — ${n_hwids} device(s) registered${NC}"
+        echo -e "${C}  ║${NC}  ${G}Only registered devices can connect.${NC}"
+        echo -e "${C}  ║${NC}  ${G}Add more devices via: opudp → option 21${NC}"
     else
-        echo -e "${C}  ║${NC}  Status :  ${Y}Unlocked — will lock on first connection${NC}"
+        echo -e "${C}  ║${NC}  Status   :  ${Y}Not locked — add devices via option 21${NC}"
     fi
-    echo -e "${C}  ╚══════════════════════════════════════════════════════╝${NC}"
+    echo -e "${C}  ╚══════════════════════════════════════════════════════════╝${NC}"
+    echo "$(now_ts) | USER CREATED | user=${username} | hwids=${hwid_list} | locked=${hwid_locked}" >> "$HWID_LOG"
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -608,7 +569,7 @@ remove_user() {
     local pass; pass=$(grep "^${username}:" "$USERS_DB" | cut -d: -f2)
     sed -i "/^${username}:/d" "$USERS_DB"
     rm -f "${SESSIONS_DIR}/${pass}.sessions" 2>/dev/null
-    rebuild_config; apply_all_rules
+    rebuild_config; apply_conn_rules
     systemctl restart "$SVC" 2>/dev/null
     echo -e "${G}  User '${username}' removed.${NC}"
 }
@@ -636,7 +597,6 @@ renew_user() {
            date -d "$ne" +%Y-%m-%d &>/dev/null || { echo -e "${R}  Invalid.${NC}"; return; } ;;
         *) echo -e "${R}  Invalid.${NC}"; return ;;
     esac
-    # Update only field 3 (expiry), preserve hwid fields 6 & 7
     sed -i "s/^\(${username}:[^:]*\):[^:]*:\([^:]*:[^:]*:[^:]*:[^:]*\)$/\1:${ne}:\2/" "$USERS_DB"
     rebuild_config; systemctl restart "$SVC" 2>/dev/null
     echo -e "${G}  '${username}' renewed → ${ne}${NC}"
@@ -652,14 +612,13 @@ cleanup_expired() {
         [[ -z "$u" ]] && continue
         if is_expired "$e"; then
             echo -e "  ${R}Removing:${NC} ${u} (expired: ${e})"
-            rm -f "${SESSIONS_DIR}/${p}.sessions" 2>/dev/null
             count=$((count+1))
         else
             echo "${u}:${p}:${e}:${bw}:${mc}:${hwid}:${hl}" >> "$tmp"
         fi
     done < "$USERS_DB"
     mv "$tmp" "$USERS_DB"
-    rebuild_config; apply_all_rules
+    rebuild_config; apply_conn_rules
     systemctl restart "$SVC" 2>/dev/null
     echo -e "${G}  Done. Removed ${count} expired user(s).${NC}"
 }
@@ -678,46 +637,33 @@ conn_stats() {
         echo -e "  ${W}Connected IPs:${NC}"
         while read -r ip; do
             [[ -z "$ip" ]] && continue
-            # Check if this IP matches any registered HWID
-            local matched_user="unknown"
-            while IFS=':' read -r u p e bw mc hwid hl; do
-                [[ "$hwid" == "$ip" ]] && matched_user="$u" && break
-            done < "$USERS_DB"
-            if [[ "$matched_user" != "unknown" ]]; then
-                echo -e "    ${G}→${NC} ${ip}  ${M}(registered: ${matched_user})${NC}"
-            else
-                echo -e "    ${Y}→${NC} ${ip}  ${Y}(unregistered device)${NC}"
-            fi
+            echo -e "    ${G}→${NC} ${ip}"
         done <<< "$ips"
     else
         echo -e "  ${Y}No active connections.${NC}"
     fi
     echo ""
     divider
-    printf "  %-16s %-18s %-8s %-8s %-17s %s\n" \
-        "USERNAME" "PASSWORD" "CONN LIM" "LIVE" "HWID IP" "HWID STATUS"
+    printf "  %-14s %-18s %-8s %-8s %-12s %s\n" \
+        "USERNAME" "PASSWORD" "CONN LIM" "LIVE" "HWID DEVICES" "LOCK"
     divider
     while IFS=':' read -r u p e bw mc hwid hl; do
         [[ -z "$u" ]] && continue
         [[ -z "$mc"   ]] && mc="0"
         [[ -z "$hwid" ]] && hwid="none"
         [[ -z "$hl"   ]] && hl="0"
-        local lc ldisp hwid_st
+        local lc ldisp n_hwids lock_st
         lc=$(ss -u state established 2>/dev/null | grep ":${LISTEN_PORT}" | wc -l)
         [[ "$mc" -eq 0 ]] && ldisp="∞" || ldisp="$mc"
+        n_hwids=$(count_hwids "$hwid")
         if [[ "$hl" == "1" && "$hwid" != "none" ]]; then
-            hwid_st="${M}LOCKED${NC}"
-        elif [[ "$hl" == "0" ]]; then
-            hwid_st="${Y}PENDING${NC}"
+            lock_st="${M}LOCKED (${n_hwids} devices)${NC}"
         else
-            hwid_st="${R}UNLOCKED${NC}"
+            lock_st="${Y}NOT SET${NC}"
         fi
-        if is_expired "$e"; then
-            hwid_st="${R}EXPIRED${NC}"
-        fi
-        local hwid_show="${hwid:0:15}"
-        printf "  %-16s %-18s %-8s %-8s %-17s " "$u" "$p" "$ldisp" "$lc" "$hwid_show"
-        echo -e "$hwid_st"
+        is_expired "$e" && lock_st="${R}EXPIRED${NC}"
+        printf "  %-14s %-18s %-8s %-8s %-12s " "$u" "$p" "$ldisp" "$lc" "${n_hwids} device(s)"
+        echo -e "$lock_st"
     done < "$USERS_DB"
 }
 
@@ -735,7 +681,7 @@ bw_report() {
     echo -e "  Total TX  : ${G}$(echo "scale=2; $tx/1048576" | bc) MB${NC}\n"
     divider
     [[ ! -s "$USERS_DB" ]] && echo -e "  ${Y}No users.${NC}" && return
-    printf "  %-16s %-18s %-11s %-5s %-5s %s\n" \
+    printf "  %-14s %-18s %-11s %-6s %-6s %s\n" \
         "USERNAME" "PASSWORD" "EXPIRY" "DAYS" "CONN" "STATUS"
     divider
     while IFS=':' read -r u p e bw mc hwid hl; do
@@ -749,7 +695,7 @@ bw_report() {
             [[ "$dl" != "∞" && "$dl" -le 3 ]] \
                 && st="${Y}EXPIRING SOON${NC}" || st="${G}ACTIVE${NC}"
         fi
-        printf "  %-16s %-18s %-11s %-5s %-5s " "$u" "$p" "$e" "$dl" "$cd"
+        printf "  %-14s %-18s %-11s %-6s %-6s " "$u" "$p" "$e" "$dl" "$cd"
         echo -e "$st"
     done < "$USERS_DB"
 }
@@ -811,7 +757,7 @@ restore_backup() {
     read -rp "  Overwrite current data? [y/N]: " c
     [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && return
     tar -xzf "${BACKUP_DIR}/${bname}" -C / 2>/dev/null
-    migrate_db; rebuild_config; apply_all_rules
+    migrate_db; rebuild_config; apply_conn_rules
     systemctl restart "$SVC" 2>/dev/null
     echo -e "${G}  Restored.${NC}"
 }
@@ -826,9 +772,8 @@ change_port() {
     echo -e "  Current: ${Y}${cur}${NC}"; echo ""
     read -rp "  New start port: " ps; read -rp "  New end port: " pe
     [[ -z "$ps" || -z "$pe" ]] && echo -e "${R}  Invalid.${NC}" && return
-    [[ ! "$ps" =~ ^[0-9]+$ || ! "$pe" =~ ^[0-9]+$ ]] \
-        && echo -e "${R}  Numbers only.${NC}" && return
-    [[ "$ps" -ge "$pe" ]] && echo -e "${R}  Start must be less than end.${NC}" && return
+    [[ ! "$ps" =~ ^[0-9]+$ || ! "$pe" =~ ^[0-9]+$ ]] && echo -e "${R}  Numbers only.${NC}" && return
+    [[ "$ps" -ge "$pe" ]] && echo -e "${R}  Start < end required.${NC}" && return
     local iface; iface=$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}')
     iptables -t nat -D PREROUTING -i "$iface" -p udp \
         --dport "${os}:${oe}" -j DNAT --to-destination ":${LISTEN_PORT}" 2>/dev/null
@@ -880,212 +825,288 @@ set_conn_limit() {
     case $cc in
         1) nl=1  ;; 2) nl=2  ;; 3) nl=3  ;;
         4) nl=5  ;; 5) nl=10 ;; 6) nl=0  ;;
-        7) read -rp "  Max: " nl
-           [[ "$nl" =~ ^[0-9]+$ ]] || nl=0 ;;
+        7) read -rp "  Max: " nl; [[ "$nl" =~ ^[0-9]+$ ]] || nl=0 ;;
         *) echo -e "${R}  Invalid.${NC}"; return ;;
     esac
-    # Update field 5 only — preserve hwid fields 6 & 7
     sed -i "s/^\(${username}:[^:]*:[^:]*:[^:]*\):[^:]*:\([^:]*:[^:]*\)$/\1:${nl}:\2/" "$USERS_DB"
-    apply_all_rules
+    apply_conn_rules
     local lbl; [[ "$nl" -eq 0 ]] && lbl="Unlimited" || lbl="${nl} device(s)"
     echo -e "${G}  '${username}' limit → ${lbl}${NC}"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  20) HWID — VIEW ALL  ← NEW
+#  HELPER: Pick user and load their HWIDs
+# ══════════════════════════════════════════════════════════════
+pick_user_show_hwids() {
+    list_users; [[ ! -s "$USERS_DB" ]] && return 1
+    read -rp "  Username: " sel_user
+    sel_user=$(echo "$sel_user" | tr -d ' ')
+    grep -q "^${sel_user}:" "$USERS_DB" 2>/dev/null \
+        || { echo -e "${R}  User not found.${NC}"; return 1; }
+    sel_hwids=$(grep "^${sel_user}:" "$USERS_DB" | cut -d: -f6)
+    sel_hl=$(grep    "^${sel_user}:" "$USERS_DB" | cut -d: -f7)
+    [[ -z "$sel_hwids" ]] && sel_hwids="none"
+    [[ -z "$sel_hl"    ]] && sel_hl="0"
+    return 0
+}
+
+# ══════════════════════════════════════════════════════════════
+#  20) HWID — VIEW ALL USERS
 # ══════════════════════════════════════════════════════════════
 hwid_view_all() {
     echo -e "${M}═══ HWID Device Lock — All Users ════════════════════════════${NC}"
     echo ""
+    echo -e "  ${W}How customers get HWID:${NC} ${C}ZIVPN Pro → ☰ Menu → Tool → HWID → Copy${NC}"
+    echo ""
     if [[ ! -s "$USERS_DB" ]]; then
-        echo -e "  ${Y}No users found.${NC}"; return
+        echo -e "  ${Y}No users.${NC}"; return
     fi
 
-    local locked=0 pending=0 unlocked=0
-
-    printf "  %-16s %-18s %-19s %s\n" "USERNAME" "PASSWORD" "REGISTERED DEVICE IP" "HWID STATUS"
-    divider
+    local total_locked=0 total_not_set=0
 
     while IFS=':' read -r u p e bw mc hwid hl; do
         [[ -z "$u" ]] && continue
         [[ -z "$hwid" ]] && hwid="none"
         [[ -z "$hl"   ]] && hl="0"
+        local n_hwids; n_hwids=$(count_hwids "$hwid")
 
-        local st_label ip_display
         if [[ "$hl" == "1" && "$hwid" != "none" ]]; then
-            st_label="${M}● LOCKED${NC}"
-            ip_display="${M}${hwid}${NC}"
-            locked=$((locked+1))
-        elif [[ "$hl" == "0" && "$hwid" == "none" ]]; then
-            st_label="${Y}○ PENDING 1ST CONNECT${NC}"
-            ip_display="${Y}awaiting...${NC}"
-            pending=$((pending+1))
+            total_locked=$((total_locked+1))
+            echo -e "  ${M}▶ ${u}${NC} (${G}${p}${NC}) — ${M}${n_hwids} device(s) locked${NC}"
+            local idx=1
+            IFS=',' read -ra arr <<< "$hwid"
+            for h in "${arr[@]}"; do
+                echo -e "    ${M}[${idx}]${NC} $(format_hwid "$h")"
+                idx=$((idx+1))
+            done
         else
-            st_label="${R}○ NO LOCK${NC}"
-            ip_display="${R}none${NC}"
-            unlocked=$((unlocked+1))
+            total_not_set=$((total_not_set+1))
+            echo -e "  ${Y}▶ ${u}${NC} (${G}${p}${NC}) — ${Y}no HWID set${NC}"
         fi
-
-        printf "  %-16s %-18s " "$u" "$p"
-        echo -e "${ip_display}        ${st_label}"
-
+        echo ""
     done < "$USERS_DB"
 
-    echo ""
     divider
-    echo -e "  ${M}Locked${NC}  : ${M}${locked}${NC} user(s) — device IP registered and enforced"
-    echo -e "  ${Y}Pending${NC} : ${Y}${pending}${NC} user(s) — will lock on first connection"
-    echo -e "  ${R}No Lock${NC} : ${R}${unlocked}${NC} user(s) — any device can connect"
+    echo -e "  ${M}Locked  :${NC} ${M}${total_locked}${NC} user(s)"
+    echo -e "  ${Y}Not Set :${NC} ${Y}${total_not_set}${NC} user(s)"
     echo ""
-    echo -e "  ${W}Tip:${NC} Use option ${M}21${NC} to manually set or reset a user's HWID."
+    echo -e "  ${W}Options 21–24 to manage HWIDs per user.${NC}"
 }
 
 # ══════════════════════════════════════════════════════════════
-#  21) HWID — SET / RESET  ← NEW
+#  21) HWID — ADD DEVICE
 # ══════════════════════════════════════════════════════════════
-hwid_manage() {
-    while true; do
-        echo -e "${M}═══ HWID — Set / Reset Device Lock ══════════════════════════${NC}"
+hwid_add_device() {
+    echo -e "${M}═══ HWID — Add Device to User ═══════════════════════════════${NC}"
+    echo ""
+    pick_user_show_hwids || return
+
+    local n_hwids; n_hwids=$(count_hwids "$sel_hwids")
+    echo ""
+    echo -e "  ${W}User: ${G}${sel_user}${NC}"
+    if [[ "$sel_hl" == "1" && "$sel_hwids" != "none" ]]; then
+        echo -e "  ${W}Current devices: ${M}${n_hwids}${NC}"
+        local idx=1
+        IFS=',' read -ra arr <<< "$sel_hwids"
+        for h in "${arr[@]}"; do
+            echo -e "    ${M}[${idx}]${NC} $(format_hwid "$h")"
+            idx=$((idx+1))
+        done
+    else
+        echo -e "  ${Y}No devices registered yet.${NC}"
+    fi
+
+    echo ""
+    echo -e "  ${W}How many new devices to add?${NC}"
+    echo "    1) 1 device   2) 2 devices  3) 3 devices"
+    echo "    4) 4 devices  5) 5 devices"
+    read -rp "  Choose [1-5]: " nc
+    [[ ! "$nc" =~ ^[1-5]$ ]] && echo -e "${R}  Invalid.${NC}" && return
+
+    local added=0
+    local updated_hwids="$sel_hwids"
+    local updated_hl="$sel_hl"
+
+    for (( i=1; i<=nc; i++ )); do
         echo ""
-        echo -e "  ${M}a)${NC} Lock user to a specific IP now"
-        echo -e "  ${M}b)${NC} Reset HWID (allow device change)"
-        echo -e "  ${M}c)${NC} Remove HWID lock completely (no lock)"
-        echo -e "  ${M}d)${NC} Force re-lock from current live connection"
-        echo -e "  ${M}0)${NC} Back"
-        echo ""
-        echo -ne "${M}Choose: ${NC}"
-        read -r sub; echo ""
+        echo -e "  ${W}New Device ${i}:${NC}"
+        echo -e "  ${C}Customer: ZIVPN Pro → ☰ Menu → Tool → HWID → tap to copy${NC}"
+        read -rp "  Paste HWID: " h_input
+        h_input=$(echo "$h_input" | tr -d ' -' | tr '[:lower:]' '[:upper:]')
 
-        case $sub in
-            # ── a) Lock to IP ─────────────────────────────────
-            a)
-                list_users; [[ ! -s "$USERS_DB" ]] && continue
-                read -rp "  Username to lock: " username
-                username=$(echo "$username" | tr -d ' ')
-                grep -q "^${username}:" "$USERS_DB" 2>/dev/null \
-                    || { echo -e "${R}  User not found.${NC}"; pause; continue; }
+        if ! is_valid_hwid "$h_input"; then
+            echo -e "  ${R}  ✗ Invalid HWID — skipped. Must be 32 hex characters.${NC}"
+            continue
+        fi
 
-                local cur_hwid cur_hl
-                cur_hwid=$(grep "^${username}:" "$USERS_DB" | cut -d: -f6)
-                cur_hl=$(grep "^${username}:"   "$USERS_DB" | cut -d: -f7)
+        if hwid_in_list "$h_input" "$updated_hwids"; then
+            echo -e "  ${Y}  ⚠ This HWID is already registered for ${sel_user}.${NC}"
+            continue
+        fi
 
-                if [[ "$cur_hl" == "1" && "$cur_hwid" != "none" ]]; then
-                    echo -e "  ${Y}Currently locked to: ${M}${cur_hwid}${NC}"
-                    read -rp "  Override with new IP? [y/N]: " ov
-                    [[ "$ov" != "y" && "$ov" != "Y" ]] && continue
-                fi
-
-                read -rp "  Enter device IP to lock to: " new_hwid
-                new_hwid=$(echo "$new_hwid" | tr -d ' ')
-                if ! [[ "$new_hwid" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-                    echo -e "${R}  Invalid IP address.${NC}"; pause; continue
-                fi
-
-                # Update fields 6 (hwid) and 7 (hwid_locked)
-                sed -i "s/^\(${username}:[^:]*:[^:]*:[^:]*:[^:]*\):[^:]*:[^:]*$/\1:${new_hwid}:1/" \
-                    "$USERS_DB"
-                apply_all_rules
-                echo -e "${G}  '${username}' locked to device IP: ${M}${new_hwid}${NC}"
-                echo -e "${Y}  Only this IP can now connect with ${username}'s password.${NC}"
-                ;;
-
-            # ── b) Reset HWID — allows device change ──────────
-            b)
-                list_users; [[ ! -s "$USERS_DB" ]] && continue
-                read -rp "  Username to reset HWID: " username
-                username=$(echo "$username" | tr -d ' ')
-                grep -q "^${username}:" "$USERS_DB" 2>/dev/null \
-                    || { echo -e "${R}  User not found.${NC}"; pause; continue; }
-
-                local old_hwid
-                old_hwid=$(grep "^${username}:" "$USERS_DB" | cut -d: -f6)
-
-                echo ""
-                echo -e "  ${Y}⚠  This will UNLOCK '${username}' from device IP: ${M}${old_hwid}${NC}"
-                echo -e "  ${Y}   Their next connection will become the new registered device.${NC}"
-                read -rp "  Confirm reset? [y/N]: " c
-                [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && continue
-
-                # Set hwid=none, hwid_locked=0 — auto-capture on next connect
-                sed -i "s/^\(${username}:[^:]*:[^:]*:[^:]*:[^:]*\):[^:]*:[^:]*$/\1:none:0/" \
-                    "$USERS_DB"
-                apply_all_rules
-                echo -e "${G}  HWID reset. '${username}' will re-lock on next connection.${NC}"
-                echo -e "${G}  Old locked IP: ${R}${old_hwid}${G} — now cleared.${NC}"
-                ;;
-
-            # ── c) Remove lock completely ──────────────────────
-            c)
-                list_users; [[ ! -s "$USERS_DB" ]] && continue
-                read -rp "  Username to remove lock: " username
-                username=$(echo "$username" | tr -d ' ')
-                grep -q "^${username}:" "$USERS_DB" 2>/dev/null \
-                    || { echo -e "${R}  User not found.${NC}"; pause; continue; }
-                echo -e "  ${R}⚠  This permanently removes HWID protection for '${username}'.${NC}"
-                echo -e "  ${R}   ANY device can connect with their password.${NC}"
-                read -rp "  Confirm? [y/N]: " c
-                [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && continue
-                sed -i "s/^\(${username}:[^:]*:[^:]*:[^:]*:[^:]*\):[^:]*:[^:]*$/\1:none:0/" \
-                    "$USERS_DB"
-                apply_all_rules
-                echo -e "${G}  HWID lock removed for '${username}'.${NC}"
-                ;;
-
-            # ── d) Force lock from live connection ─────────────
-            d)
-                list_users; [[ ! -s "$USERS_DB" ]] && continue
-                read -rp "  Username to force-lock: " username
-                username=$(echo "$username" | tr -d ' ')
-                grep -q "^${username}:" "$USERS_DB" 2>/dev/null \
-                    || { echo -e "${R}  User not found.${NC}"; pause; continue; }
-
-                # Get currently connected IPs
-                local live_ips
-                live_ips=$(get_connected_ips)
-                if [[ -z "$live_ips" ]]; then
-                    echo -e "${Y}  No live connections detected right now.${NC}"
-                    echo -e "${Y}  Ask the user to connect first, then run this option.${NC}"
-                    pause; continue
-                fi
-
-                echo ""
-                echo -e "  ${W}Currently connected IPs:${NC}"
-                local i=1
-                declare -a ip_arr=()
-                while read -r lip; do
-                    [[ -z "$lip" ]] && continue
-                    echo -e "    ${G}${i})${NC} ${lip}"
-                    ip_arr+=("$lip")
-                    i=$((i+1))
-                done <<< "$live_ips"
-
-                echo ""
-                read -rp "  Select IP number to lock to: " sel
-                if ! [[ "$sel" =~ ^[0-9]+$ ]] || \
-                   [[ "$sel" -lt 1 || "$sel" -gt "${#ip_arr[@]}" ]]; then
-                    echo -e "${R}  Invalid selection.${NC}"; pause; continue
-                fi
-
-                local chosen_ip="${ip_arr[$((sel-1))]}"
-                sed -i "s/^\(${username}:[^:]*:[^:]*:[^:]*:[^:]*\):[^:]*:[^:]*$/\1:${chosen_ip}:1/" \
-                    "$USERS_DB"
-                apply_all_rules
-
-                echo -e "${G}  '${username}' force-locked to live IP: ${M}${chosen_ip}${NC}"
-                echo -e "${M}  $(now_ts) | FORCE-LOCKED | user=${username} | ip=${chosen_ip}${NC}" \
-                    >> "$HWID_LOG"
-                ;;
-
-            0) break ;;
-            *) echo -e "${R}  Invalid.${NC}" ;;
-        esac
-        pause
-        clear
+        updated_hwids=$(add_hwid_to_list "$h_input" "$updated_hwids")
+        updated_hl="1"
+        echo -e "  ${G}  ✓ Device ${i} added: $(format_hwid "$h_input")${NC}"
+        added=$((added+1))
     done
+
+    if [[ $added -gt 0 ]]; then
+        sed -i "s/^\(${sel_user}:[^:]*:[^:]*:[^:]*:[^:]*\):[^:]*:[^:]*$/\1:${updated_hwids}:${updated_hl}/" "$USERS_DB"
+        echo ""
+        echo -e "${G}  ✓ Added ${added} new device(s) to '${sel_user}'.${NC}"
+        local total; total=$(count_hwids "$updated_hwids")
+        echo -e "${G}  Total registered devices: ${M}${total}${NC}"
+        echo "$(now_ts) | HWID ADD | user=${sel_user} | new=${added} | total_hwids=${updated_hwids}" >> "$HWID_LOG"
+    else
+        echo -e "${Y}  No valid new HWIDs were added.${NC}"
+    fi
 }
 
 # ══════════════════════════════════════════════════════════════
-#  22) HWID — MONITOR LOGS  ← NEW
+#  22) HWID — REMOVE DEVICE
+# ══════════════════════════════════════════════════════════════
+hwid_remove_device() {
+    echo -e "${M}═══ HWID — Remove Device from User ══════════════════════════${NC}"
+    echo ""
+    pick_user_show_hwids || return
+
+    if [[ "$sel_hl" != "1" || "$sel_hwids" == "none" ]]; then
+        echo -e "  ${Y}No devices registered for '${sel_user}'.${NC}"
+        return
+    fi
+
+    echo ""
+    echo -e "  ${W}User: ${G}${sel_user}${NC} — registered devices:${NC}"
+    echo ""
+
+    local idx=1
+    declare -a hwid_arr=()
+    IFS=',' read -ra hwid_arr <<< "$sel_hwids"
+    for h in "${hwid_arr[@]}"; do
+        echo -e "    ${M}[${idx}]${NC} $(format_hwid "$h")   ${C}(${h})${NC}"
+        idx=$((idx+1))
+    done
+
+    echo ""
+    echo -e "  ${W}Enter device number(s) to remove${NC}"
+    echo -e "  ${Y}(e.g. 1  or  1,3  or  all)${NC}"
+    read -rp "  Remove: " rem_input
+
+    local updated_hwids="$sel_hwids"
+    local removed=0
+
+    if [[ "${rem_input,,}" == "all" ]]; then
+        read -rp "  Remove ALL devices from '${sel_user}'? [y/N]: " c
+        [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && return
+        removed=${#hwid_arr[@]}
+        sed -i "s/^\(${sel_user}:[^:]*:[^:]*:[^:]*:[^:]*\):[^:]*:[^:]*$/\1:none:0/" "$USERS_DB"
+        echo -e "${G}  All ${removed} device(s) removed from '${sel_user}'.${NC}"
+        echo "$(now_ts) | HWID REMOVE ALL | user=${sel_user}" >> "$HWID_LOG"
+        return
+    fi
+
+    IFS=',' read -ra rem_indices <<< "$rem_input"
+    for ri in "${rem_indices[@]}"; do
+        ri=$(echo "$ri" | tr -d ' ')
+        if ! [[ "$ri" =~ ^[0-9]+$ ]] || \
+           [[ "$ri" -lt 1 || "$ri" -gt "${#hwid_arr[@]}" ]]; then
+            echo -e "  ${Y}  Invalid number: ${ri} — skipped.${NC}"
+            continue
+        fi
+        local target_hwid="${hwid_arr[$((ri-1))]}"
+        updated_hwids=$(remove_hwid_from_list "$target_hwid" "$updated_hwids")
+        echo -e "  ${R}  Removed [${ri}]:${NC} $(format_hwid "$target_hwid")"
+        removed=$((removed+1))
+        echo "$(now_ts) | HWID REMOVE | user=${sel_user} | hwid=${target_hwid}" >> "$HWID_LOG"
+    done
+
+    if [[ $removed -gt 0 ]]; then
+        local new_hl="1"
+        [[ "$updated_hwids" == "none" ]] && new_hl="0"
+        sed -i "s/^\(${sel_user}:[^:]*:[^:]*:[^:]*:[^:]*\):[^:]*:[^:]*$/\1:${updated_hwids}:${new_hl}/" "$USERS_DB"
+        local remaining; remaining=$(count_hwids "$updated_hwids")
+        echo ""
+        echo -e "${G}  Removed ${removed} device(s). Remaining: ${remaining}${NC}"
+    else
+        echo -e "${Y}  Nothing removed.${NC}"
+    fi
+}
+
+# ══════════════════════════════════════════════════════════════
+#  23) HWID — VIEW USER DEVICES
+# ══════════════════════════════════════════════════════════════
+hwid_view_user() {
+    echo -e "${M}═══ HWID — View User's Registered Devices ═══════════════════${NC}"
+    echo ""
+    pick_user_show_hwids || return
+
+    local n_hwids; n_hwids=$(count_hwids "$sel_hwids")
+    echo ""
+    echo -e "  ${W}User     :${NC} ${G}${sel_user}${NC}"
+
+    if [[ "$sel_hl" == "1" && "$sel_hwids" != "none" ]]; then
+        echo -e "  ${W}Devices  :${NC} ${M}${n_hwids} registered${NC}"
+        echo -e "  ${W}Status   :${NC} ${M}LOCKED — only these devices can connect${NC}"
+        echo ""
+        divider
+        local idx=1
+        IFS=',' read -ra arr <<< "$sel_hwids"
+        for h in "${arr[@]}"; do
+            echo ""
+            echo -e "  ${M}Device [${idx}]${NC}"
+            echo -e "    Full HWID  : ${M}${h}${NC}"
+            echo -e "    Formatted  : ${M}$(format_hwid "$h")${NC}"
+            idx=$((idx+1))
+        done
+        divider
+        echo ""
+        echo -e "  ${Y}Use option 21 to add more devices.${NC}"
+        echo -e "  ${Y}Use option 22 to remove a device.${NC}"
+    else
+        echo -e "  ${W}Devices  :${NC} ${Y}None registered${NC}"
+        echo -e "  ${W}Status   :${NC} ${Y}UNLOCKED — any device can connect${NC}"
+        echo ""
+        echo -e "  ${Y}Use option 21 to register devices.${NC}"
+    fi
+}
+
+# ══════════════════════════════════════════════════════════════
+#  24) HWID — CLEAR ALL DEVICES
+# ══════════════════════════════════════════════════════════════
+hwid_clear_all() {
+    echo -e "${M}═══ HWID — Clear All Devices ════════════════════════════════${NC}"
+    echo ""
+    pick_user_show_hwids || return
+
+    local n_hwids; n_hwids=$(count_hwids "$sel_hwids")
+
+    if [[ "$sel_hwids" == "none" || $n_hwids -eq 0 ]]; then
+        echo -e "  ${Y}  '${sel_user}' has no registered devices.${NC}"
+        return
+    fi
+
+    echo ""
+    echo -e "  ${W}User: ${G}${sel_user}${NC} has ${M}${n_hwids}${NC} registered device(s):"
+    echo ""
+    local idx=1
+    IFS=',' read -ra arr <<< "$sel_hwids"
+    for h in "${arr[@]}"; do
+        echo -e "    ${M}[${idx}]${NC} $(format_hwid "$h")"
+        idx=$((idx+1))
+    done
+    echo ""
+    echo -e "  ${R}⚠  This will remove ALL HWID locks. Any device can connect after.${NC}"
+    read -rp "  Confirm clear all? [y/N]: " c
+    [[ "$c" != "y" && "$c" != "Y" ]] && echo "  Cancelled." && return
+
+    sed -i "s/^\(${sel_user}:[^:]*:[^:]*:[^:]*:[^:]*\):[^:]*:[^:]*$/\1:none:0/" "$USERS_DB"
+    echo -e "${G}  All ${n_hwids} device(s) cleared for '${sel_user}'.${NC}"
+    echo -e "${Y}  Use option 21 to register new devices.${NC}"
+    echo "$(now_ts) | HWID CLEAR ALL | user=${sel_user} | removed_hwids=${sel_hwids}" >> "$HWID_LOG"
+}
+
+# ══════════════════════════════════════════════════════════════
+#  25) HWID — MONITOR LOGS
 # ══════════════════════════════════════════════════════════════
 hwid_logs() {
     echo -e "${M}═══ HWID Monitor Logs ═══════════════════════════════════════${NC}"
@@ -1093,57 +1114,43 @@ hwid_logs() {
     echo -e "  ${W}Recent HWID events (last 50 lines):${NC}"
     echo ""
     divider
-
     if [[ ! -s "$HWID_LOG" ]]; then
-        echo -e "  ${Y}No HWID events logged yet.${NC}"
-        echo -e "  ${Y}Events appear once users start connecting.${NC}"
+        echo -e "  ${Y}No HWID events yet.${NC}"
     else
         tail -50 "$HWID_LOG" | while read -r line; do
             if echo "$line" | grep -q "BLOCKED"; then
                 echo -e "  ${R}${line}${NC}"
-            elif echo "$line" | grep -q "LOCKED\|FORCE"; then
+            elif echo "$line" | grep -q "LOCKED\|SET\|ADD"; then
                 echo -e "  ${M}${line}${NC}"
-            elif echo "$line" | grep -q "OK\|CAPTURE"; then
+            elif echo "$line" | grep -q "OK\|CREATED"; then
                 echo -e "  ${G}${line}${NC}"
+            elif echo "$line" | grep -q "RESET\|REMOVE\|CLEAR"; then
+                echo -e "  ${Y}${line}${NC}"
             else
                 echo -e "  ${C}${line}${NC}"
             fi
         done
     fi
-
     echo ""
     divider
     echo ""
-    echo -e "  ${W}Live monitor status:${NC}"
     systemctl is-active --quiet opudp-hwid-monitor \
-        && echo -e "  ${G}● HWID Monitor is running${NC}" \
-        || echo -e "  ${R}● HWID Monitor is stopped${NC}"
-
+        && echo -e "  ${G}● HWID Monitor: running${NC}" \
+        || echo -e "  ${R}● HWID Monitor: stopped${NC}"
     echo ""
-    echo -e "  ${W}Options:${NC}"
-    echo -e "  ${M}r)${NC} Restart HWID monitor"
-    echo -e "  ${M}c)${NC} Clear HWID log"
-    echo -e "  ${M}l)${NC} Watch live (tail -f)"
-    echo -e "  ${M}0)${NC} Back"
+    echo -e "  ${M}r)${NC} Restart monitor  ${M}c)${NC} Clear log  ${M}l)${NC} Watch live  ${M}0)${NC} Back"
     echo ""
     echo -ne "${M}Choose: ${NC}"
     read -r lsub
     case $lsub in
-        r)
-            systemctl restart opudp-hwid-monitor
-            echo -e "${G}  HWID Monitor restarted.${NC}"
-            ;;
-        c)
-            read -rp "  Clear all HWID logs? [y/N]: " c
-            [[ "$c" == "y" || "$c" == "Y" ]] \
-                && > "$HWID_LOG" \
-                && echo -e "${G}  Log cleared.${NC}" \
-                || echo "  Cancelled."
-            ;;
-        l)
-            echo -e "${C}  Watching live HWID log — Ctrl+C to stop${NC}"
-            tail -f "$HWID_LOG"
-            ;;
+        r) systemctl restart opudp-hwid-monitor
+           echo -e "${G}  Monitor restarted.${NC}" ;;
+        c) read -rp "  Clear all HWID logs? [y/N]: " c
+           [[ "$c" == "y" || "$c" == "Y" ]] \
+               && > "$HWID_LOG" && echo -e "${G}  Cleared.${NC}" \
+               || echo "  Cancelled." ;;
+        l) echo -e "${C}  Watching — Ctrl+C to stop${NC}"
+           tail -f "$HWID_LOG" ;;
     esac
 }
 
@@ -1157,34 +1164,28 @@ uninstall() {
     echo ""
     read -rp "  Type 'yes' to confirm: " confirm
     [[ "$confirm" != "yes" ]] && echo "  Cancelled." && return
-
     local iface port ps pe
     iface=$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}')
     port=$(get_port); ps=$(echo "$port"|cut -d:-f1); pe=$(echo "$port"|cut -d:-f2)
-
     systemctl stop    "$SVC" opudp-hwid-monitor 2>/dev/null
     systemctl disable "$SVC" opudp-hwid-monitor 2>/dev/null
     rm -f /etc/systemd/system/zivpn.service
     rm -f /etc/systemd/system/opudp-hwid-monitor.service
     systemctl daemon-reload 2>/dev/null
-
     rm -f "$BIN" /usr/local/bin/opudp /usr/local/bin/opudp-hwid-monitor
-
     iptables -t nat -D PREROUTING -i "$iface" -p udp \
         --dport "${ps}:${pe}" -j DNAT --to-destination ":${LISTEN_PORT}" 2>/dev/null
-    while iptables -L INPUT -n --line-numbers 2>/dev/null | grep -q "opudp"; do
+    while iptables -L INPUT -n --line-numbers 2>/dev/null | grep -q "opudp-conn"; do
         local ln
-        ln=$(iptables -L INPUT -n --line-numbers 2>/dev/null | grep "opudp" | head -1 | awk '{print $1}')
+        ln=$(iptables -L INPUT -n --line-numbers 2>/dev/null | grep "opudp-conn" | head -1 | awk '{print $1}')
         [[ -z "$ln" ]] && break
         iptables -D INPUT "$ln" 2>/dev/null
     done
     iptables-save > /etc/iptables/rules.v4 2>/dev/null
     ufw delete allow "${ps}:${pe}/udp"    2>/dev/null
     ufw delete allow "${LISTEN_PORT}/udp" 2>/dev/null
-
     rm -rf /etc/zivpn /etc/sysctl.d/99-opudp.conf
     rm -f /etc/network/if-pre-up.d/opudp-iptables
-
     echo -e "\n${G}  Fully removed.${NC}"
     exit 0
 }
@@ -1200,29 +1201,32 @@ while true; do
     read -r choice
     echo ""
     case $choice in
-        1)  start_svc       ;;
-        2)  stop_svc        ;;
-        3)  restart_svc     ;;
-        4)  show_status     ;;
-        5)  list_users      ;;
-        6)  add_user        ;;
-        7)  remove_user     ;;
-        8)  renew_user      ;;
-        9)  cleanup_expired ;;
-        10) conn_stats      ;;
-        11) bw_report       ;;
-        12) reset_bandwidth ;;
-        13) speed_test      ;;
-        14) live_logs       ;;
-        15) backup_data     ;;
-        16) restore_backup  ;;
-        17) change_port     ;;
-        18) auto_update     ;;
-        19) set_conn_limit  ;;
-        20) hwid_view_all   ;;
-        21) hwid_manage     ;;
-        22) hwid_logs       ;;
-        99) uninstall       ;;
+        1)  start_svc          ;;
+        2)  stop_svc           ;;
+        3)  restart_svc        ;;
+        4)  show_status        ;;
+        5)  list_users         ;;
+        6)  add_user           ;;
+        7)  remove_user        ;;
+        8)  renew_user         ;;
+        9)  cleanup_expired    ;;
+        10) conn_stats         ;;
+        11) bw_report          ;;
+        12) reset_bandwidth    ;;
+        13) speed_test         ;;
+        14) live_logs          ;;
+        15) backup_data        ;;
+        16) restore_backup     ;;
+        17) change_port        ;;
+        18) auto_update        ;;
+        19) set_conn_limit     ;;
+        20) hwid_view_all      ;;
+        21) hwid_add_device    ;;
+        22) hwid_remove_device ;;
+        23) hwid_view_user     ;;
+        24) hwid_clear_all     ;;
+        25) hwid_logs          ;;
+        99) uninstall          ;;
         0)  echo -e "  ${G}Bye!${NC}"; exit 0 ;;
         *)  echo -e "${R}  Invalid option.${NC}" ;;
     esac
